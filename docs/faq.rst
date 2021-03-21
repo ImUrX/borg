@@ -27,7 +27,13 @@ which is slower.
 Can I backup from multiple servers into a single repository?
 ------------------------------------------------------------
 
-Yes, but in order for the deduplication used by |project_name| to work, it
+Yes, this is *possible* from the technical standpoint, but it is
+*not recommended* from the security perspective. |project_name| is
+built upon a defined :ref:`attack_model` that cannot provide its
+guarantees for multiple clients using the same repository. See
+:ref:`borg_security_critique` for a detailed explanation.
+
+Also, in order for the deduplication used by |project_name| to work, it
 needs to keep a local cache containing checksums of all file
 chunks already stored in the repository. This cache is stored in
 ``~/.cache/borg/``.  If |project_name| detects that a repository has been
@@ -88,6 +94,31 @@ Also, you must not run borg against multiple instances of the same repo
 There is also a similar encryption security issue for the disaster case:
 If you lose repo and the borg client-side config/cache and you restore
 the repo from an older copy-of-repo, you also run into AES counter reuse.
+
+"this is either an attack or unsafe" warning
+--------------------------------------------
+
+About the warning:
+
+  Cache, or information obtained from the security directory is newer than
+  repository - this is either an attack or unsafe (multiple repos with same ID)
+
+"unsafe": If not following the advice from the previous section, you can easily
+run into this by yourself by restoring an older copy of your repository.
+
+"attack": maybe an attacker has replaced your repo by an older copy, trying to
+trick you into AES counter reuse, trying to break your repo encryption.
+
+If you'ld decide to ignore this and accept unsafe operation for this repository,
+you could delete the manifest-timestamp and the local cache:
+
+::
+
+  borg config repo id   # shows the REPO_ID
+  rm ~/.config/borg/REPO_ID/manifest-timestamp
+  borg delete --cache-only REPO
+
+This is an unsafe and unsupported way to use borg, you have been warned.
 
 Which file types, attributes, etc. are *not* preserved?
 -------------------------------------------------------
@@ -178,6 +209,20 @@ How can I backup huge file(s) over a unstable connection?
 This is not a problem anymore.
 
 For more details, see :ref:`checkpoints_parts`.
+
+How can I switch append-only mode on and off?
+-----------------------------------------------------------------------------------------------------------------------------------
+
+You could do that (via borg config REPO append_only 0/1), but using different
+ssh keys and different entries in ``authorized_keys`` is much easier and also
+maybe has less potential of things going wrong somehow.
+
+
+My machine goes to sleep causing `Broken pipe`
+----------------------------------------------
+
+When backing up your data over the network, your machine should not go to sleep.
+On macOS you can use `caffeinate` to avoid that.
 
 How can I restore huge file(s) over an unstable connection?
 -----------------------------------------------------------
@@ -352,6 +397,34 @@ to change them.
 
 Security
 ########
+
+.. _borg_security_critique:
+
+Isn't BorgBackup's AES-CTR crypto broken?
+-----------------------------------------
+
+If a nonce (counter) value is reused, AES-CTR mode crypto is broken.
+
+To exploit the AES counter management issue, an attacker would need to have
+access to the borg repository.
+
+By tampering with the repo, the attacker could bring the repo into a state so
+that it reports a lower "highest used counter value" than the one that actually
+was used. The client would usually notice that, because it rather trusts the
+clientside stored "highest used counter value" than trusting the server.
+
+But there are situations, where this is simply not possible:
+
+- If clients A and B used the repo, the client A can only know its own highest
+  CTR value, but not the one produced by B. That is only known to (B and) the
+  server (the repo) and thus the client A needs to trust the server about the
+  value produced by B in that situation. You can't do much about this except
+  not having multiple clients per repo.
+
+- Even if there is only one client, if client-side information is completely
+  lost (e.g. due to disk defect), the client also needs to trust the value from
+  server side. You can avoid this by not continuing to write to the repository
+  after you have lost clientside borg information.
 
 .. _home_config_borg:
 
@@ -638,6 +711,17 @@ connections and release the lock).
 The borg cache eats way too much disk space, what can I do?
 -----------------------------------------------------------
 
+This may especially happen if borg needs to rebuild the local "chunks" index -
+either because it was removed, or because it was not coherent with the
+repository state any more (e.g. because another borg instance changed the
+repository).
+
+To optimize this rebuild process, borg caches per-archive information in the
+``chunks.archive.d/`` directory. It won't help the first time it happens, but it
+will make the subsequent rebuilds faster (because it needs to transfer less data
+from the repository). While being faster, the cache needs quite some disk space,
+which might be unwanted.
+
 There is a temporary (but maybe long lived) hack to avoid using lots of disk
 space for chunks.archive.d (see :issue:`235` for details):
 
@@ -691,6 +775,67 @@ If you run into that, try this:
   the parent directory (or even everything)
 - mount the repo using FUSE and use some file manager
 
+.. _expected_performance:
+
+What's the expected backup performance?
+---------------------------------------
+
+A first backup will usually be somehow "slow" because there is a lot of data
+to process. Performance here depends on a lot of factors, so it is hard to
+give specific numbers.
+
+Subsequent backups are usually very fast if most files are unchanged and only
+a few are new or modified. The high performance on unchanged files primarily depends
+only on a few factors (like fs recursion + metadata reading performance and the
+files cache working as expected) and much less on other factors.
+
+E.g., for this setup:
+
+- server grade machine (4C/8T 2013 Xeon, 64GB RAM, 2x good 7200RPM disks)
+- local zfs filesystem (mirrored) containing the backup source data
+- repository is remote (does not matter much for unchanged files)
+- backup job runs while machine is otherwise idle
+
+The observed performance is that |project_name| can process about
+**1 million unchanged files (and a few small changed ones) in 4 minutes!**
+
+If you are seeing much less than that in similar circumstances, read the next
+few FAQ entries below.
+
+.. _slow_backup:
+
+Why is backup slow for me?
+--------------------------
+
+So, if you feel your |project_name| backup is too slow somehow, you should find out why.
+
+The usual way to approach this is to add ``--list --filter=AME --stats`` to your
+``borg create`` call to produce more log output, including a file list (with file status
+characters) and also some statistics at the end of the backup.
+
+Then you do the backup and look at the log output:
+
+- stats: Do you really have little changes or are there more changes than you thought?
+  In the stats you can see the overall volume of changed data, which needed to be
+  added to the repo. If that is a lot, that can be the reason why it is slow.
+- ``A`` status ("added") in the file list:
+  If you see that often, you have a lot of new files (files that |project_name| did not find
+  in the files cache). If you think there is something wrong with that (the file was there
+  already in the previous backup), please read the FAQ entries below.
+- ``M`` status ("modified") in the file list:
+  If you see that often, |project_name| thinks that a lot of your files might be modified
+  (|project_name| found them in the files cache, but the metadata read from the filesystem did
+  not match the metadata stored in the files cache).
+  In such a case, |project_name| will need to process the files' contents completely, which is
+  much slower than processing unmodified files (|project_name| does not read their contents!).
+  The metadata values used in this comparison are determined by the ``--files-cache`` option
+  and could be e.g. size, ctime and inode number (see the ``borg create`` docs for more
+  details and potential issues).
+  You can use the ``stat`` command on files to manually look at fs metadata to debug if
+  there is any unexpected change triggering the ``M`` status.
+
+See also the next few FAQ entries for more details.
+
 .. _a_status_oddity:
 
 I am seeing 'A' (added) status for an unchanged file!?
@@ -698,8 +843,8 @@ I am seeing 'A' (added) status for an unchanged file!?
 
 The files cache is used to determine whether |project_name| already
 "knows" / has backed up a file and if so, to skip the file from
-chunking. It does intentionally *not* contain files that have a timestamp
-same as the newest timestamp in the created archive.
+chunking. It intentionally *excludes* files that have a timestamp
+which is the same as the newest timestamp in the created archive.
 
 So, if you see an 'A' status for unchanged file(s), they are likely the files
 with the most recent timestamp in that archive.
@@ -730,7 +875,11 @@ safe change detection (see also the --files-cache option).
 
 Furthermore, pathnames recorded in files cache are always absolute, even if you specify
 source directories with relative pathname. If relative pathnames are stable, but absolute are
-not (for example if you mount a filesystem without stable mount points for each backup or if you are running the backup from a filesystem snapshot whose name is not stable), borg will assume that files are different and will report them as 'added', even though no new chunks will be actually recorded for them. To avoid this, you could bind mount your source directory in a directory with the stable path.
+not (for example if you mount a filesystem without stable mount points for each backup or
+if you are running the backup from a filesystem snapshot whose name is not stable), borg
+will assume that files are different and will report them as 'added', even though no new
+chunks will be actually recorded for them. To avoid this, you could bind mount your source
+directory in a directory with the stable path.
 
 .. _always_chunking:
 

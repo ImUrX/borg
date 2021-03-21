@@ -56,6 +56,10 @@ General:
     BORG_REMOTE_PATH
         When set, use the given path as borg executable on the remote (defaults to "borg" if unset).
         Using ``--remote-path PATH`` commandline option overrides the environment variable.
+    BORG_FILES_CACHE_SUFFIX
+        When set to a value at least one character long, instructs borg to use a specifically named
+        (based on the suffix) alternative files cache. This can be used to avoid loading and saving
+        cache entries for backup sources other than the current sources.
     BORG_FILES_CACHE_TTL
         When set to a numeric value, this determines the maximum "time to live" for the files cache
         entries (default: 20). The files cache is used to quickly determine whether a file is unchanged.
@@ -83,15 +87,15 @@ Some automatic "answerers" (if set, they automatically answer confirmation quest
     BORG_RELOCATED_REPO_ACCESS_IS_OK=no (or =yes)
         For "Warning: The repository at location ... was previously located at ..."
     BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=NO (or =YES)
-        For "Warning: 'check --repair' is an experimental feature that might result in data loss."
+        For "This is a potentially dangerous function..." (check --repair)
     BORG_DELETE_I_KNOW_WHAT_I_AM_DOING=NO (or =YES)
         For "You requested to completely DELETE the repository *including* all archives it contains:"
-    BORG_RECREATE_I_KNOW_WHAT_I_AM_DOING=NO (or =YES)
-        For "recreate is an experimental feature."
 
     Note: answers are case sensitive. setting an invalid answer value might either give the default
     answer or ask you interactively, depending on whether retries are allowed (they by default are
     allowed). So please test your scripts interactively before making them a non-interactive script.
+
+.. _XDG env var: https://specifications.freedesktop.org/basedir-spec/0.6/ar01s03.html
 
 Directories and files:
     BORG_BASE_DIR

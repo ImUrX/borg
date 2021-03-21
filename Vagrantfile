@@ -7,17 +7,12 @@ $cpus = Integer(ENV.fetch('VMCPUS', '4'))  # create VMs with that many cpus
 $xdistn = Integer(ENV.fetch('XDISTN', '4'))  # dispatch tests to that many pytest workers
 $wmem = $xdistn * 256  # give the VM additional memory for workers [MB]
 
-def packages_prepare_wheezy
-  return <<-EOF
-      # debian 7 wheezy does not have lz4, but it is available from wheezy-backports:
-      echo "deb http://http.debian.net/debian wheezy-backports main" > /etc/apt/sources.list.d/wheezy-backports.list
-  EOF
-end
-
 def packages_debianoid(user)
   return <<-EOF
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
+    # in case we get a grub update, it must not interactively ask for boot device:
+    echo "set grub-pc/install_devices /dev/sda" | debconf-communicate
     # install all the (security and other) updates
     apt-get dist-upgrade -y
     # for building borgbackup and dependencies:
@@ -25,21 +20,11 @@ def packages_debianoid(user)
     usermod -a -G fuse #{user}
     chgrp fuse /dev/fuse
     chmod 666 /dev/fuse
-    apt-get install -y fakeroot build-essential git
+    apt-get install -y fakeroot build-essential git curl
     apt-get install -y python3-dev python3-setuptools
     # for building python:
-    apt-get install -y zlib1g-dev libbz2-dev libncurses5-dev libreadline-dev liblzma-dev libsqlite3-dev
-    # this way it works on older dists (like ubuntu 12.04) also:
-    # for python 3.2 on ubuntu 12.04 we need pip<8 and virtualenv<14 as
-    # newer versions are not compatible with py 3.2 any more.
-    if which easy_install3 2> /dev/null; then
-        # works up to xenial / stretch
-        easy_install3 -i https://pypi.python.org/simple/ 'pip<8.0'
-        pip3 install 'virtualenv<14.0'
-    else
-        # works on recent debian / ubuntu
-        apt-get install -y python3-pip virtualenv python3-virtualenv
-    fi
+    apt-get install -y zlib1g-dev libbz2-dev libncurses5-dev libreadline-dev liblzma-dev libsqlite3-dev libffi-dev
+    apt-get install -y python3-pip virtualenv python3-virtualenv
   EOF
 end
 
@@ -56,7 +41,7 @@ def packages_redhatted
     # needed to compile msgpack-python (otherwise it will use slow fallback code):
     yum install -y gcc-c++
     # for building python:
-    yum install -y zlib-devel bzip2-devel ncurses-devel readline-devel xz xz-devel sqlite-devel
+    yum install -y zlib-devel bzip2-devel ncurses-devel readline-devel xz xz-devel sqlite-devel libffi-devel
     #yum install -y python-pip
     #pip install virtualenv
   EOF
@@ -65,26 +50,17 @@ end
 def packages_darwin
   return <<-EOF
     # install all the (security and other) updates
-    # note: the base machine is old and as uptodate as it gets,
-    # thus we do not need to install updates for the OS.
-    #sudo softwareupdate --ignore iTunesX
-    #sudo softwareupdate --ignore iTunes
-    #sudo softwareupdate --ignore "Install macOS High Sierra"
-    #sudo softwareupdate --install --all
-    # get osxfuse 3.x release code from github:
-    curl -s -L https://github.com/osxfuse/osxfuse/releases/download/osxfuse-3.10.4/osxfuse-3.10.4.dmg >osxfuse.dmg
-    MOUNTDIR=$(echo `hdiutil mount osxfuse.dmg | tail -1 | awk '{$1="" ; print $0}'` | xargs -0 echo) \
-    && sudo installer -pkg "${MOUNTDIR}/Extras/FUSE for macOS 3.10.4.pkg" -target /
-    sudo chown -R vagrant /usr/local  # brew must be able to create stuff here
-    # brew is already installed in the base box
-    #ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
-    brew update
-    brew install openssl || brew upgrade openssl
-    brew install lz4 || brew upgrade lz4
-    brew install xz  || brew upgrade xz  # required for python lzma module
-    brew install fakeroot || brew upgrade fakeroot
-    brew install git || brew upgrade git
-    brew install pkg-config || brew upgrade pkg-config
+    sudo softwareupdate --ignore iTunesX
+    sudo softwareupdate --ignore iTunes
+    sudo softwareupdate --ignore Safari
+    sudo softwareupdate --ignore "Install macOS High Sierra"
+    sudo softwareupdate --install --all
+    which brew || CI=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+    brew update > /dev/null
+    brew install pkg-config readline openssl@1.1 zstd lz4 xz fakeroot git
+    brew install --cask osxfuse
+    brew upgrade  # upgrade everything
+    echo 'export PKG_CONFIG_PATH=/usr/local/opt/openssl@1.1/lib/pkgconfig' >> ~vagrant/.bash_profile
   EOF
 end
 
@@ -98,7 +74,7 @@ def packages_freebsd
     pkg install -y openssl liblz4 fusefs-libs pkgconf
     pkg install -y git bash
     # for building python:
-    pkg install -y sqlite3
+    pkg install -y sqlite3 libffi
     # make bash default / work:
     chsh -s bash vagrant
     mount -t fdescfs fdesc /dev/fd
@@ -161,7 +137,8 @@ def packages_openindiana
     # needs separate provisioning step + reboot:
     #pkg update
     # already installed:
-    #pkg install python-35 virtualenv-35 pip-35 clang-40 lz4 zstd git
+    #pkg install python-37 python-35 virtualenv-35 pip-35 clang-40 lz4 zstd git
+    pkg install gcc-7
     ln -sf /usr/bin/python3.5 /usr/bin/pyton3
     ln -sf /usr/bin/virtualenv-3.5 /usr/bin/virtualenv
     ln -sf /usr/bin/pip-3.5 /usr/bin/pip
@@ -243,9 +220,9 @@ def install_pythons(boxname)
     . ~/.bash_profile
     pyenv install 3.5.3  # tests, 3.5.3 is first to support openssl 1.1
     pyenv install 3.6.2  # tests
-    pyenv install 3.7.0  # tests
+    pyenv install 3.7.9  # binary build, use latest 3.7.x release
     pyenv install 3.8.0  # tests
-    pyenv install 3.5.9  # binary build, use latest 3.5.x release
+    pyenv install 3.9.0  # tests
     pyenv rehash
   EOF
 end
@@ -262,9 +239,9 @@ def build_pyenv_venv(boxname)
   return <<-EOF
     . ~/.bash_profile
     cd /vagrant/borg
-    # use the latest 3.5 release
-    pyenv global 3.5.9
-    pyenv virtualenv 3.5.9 borg-env
+    # use the latest 3.7 release
+    pyenv global 3.7.9
+    pyenv virtualenv 3.7.9 borg-env
     ln -s ~/.pyenv/versions/borg-env .
   EOF
 end
@@ -301,7 +278,7 @@ def install_pyinstaller()
     . borg-env/bin/activate
     git clone https://github.com/thomaswaldmann/pyinstaller.git
     cd pyinstaller
-    git checkout v3.2.1
+    git checkout v4.2-maint
     python setup.py install
   EOF
 end
@@ -314,6 +291,7 @@ def build_binary_with_pyinstaller(boxname)
     cd borg
     pyinstaller --clean --distpath=/vagrant/borg scripts/borg.exe.spec
     echo 'export PATH="/vagrant/borg:$PATH"' >> ~/.bash_profile
+    cd .. && tar -czvf borg.tgz borg-dir
   EOF
 end
 
@@ -324,16 +302,16 @@ def run_tests(boxname)
     . ../borg-env/bin/activate
     if which pyenv 2> /dev/null; then
       # for testing, use the earliest point releases of the supported python versions:
-      pyenv global 3.5.3 3.6.2 3.7.0 3.8.0
-      pyenv local 3.5.3 3.6.2 3.7.0 3.8.0
+      pyenv global 3.5.3 3.6.2 3.7.9 3.8.0 3.9.0
+      pyenv local 3.5.3 3.6.2 3.7.9 3.8.0 3.9.0
     fi
     # otherwise: just use the system python
     if which fakeroot 2> /dev/null; then
       echo "Running tox WITH fakeroot -u"
-      fakeroot -u tox --skip-missing-interpreters
+      fakeroot -u tox --skip-missing-interpreters -e py35,py36,py37,py38,py39
     else
       echo "Running tox WITHOUT fakeroot -u"
-      tox --skip-missing-interpreters
+      tox --skip-missing-interpreters -e py35,py36,py37,py38,py39
     fi
   EOF
 end
@@ -415,18 +393,6 @@ Vagrant.configure(2) do |config|
     b.vm.provision "run tests", :type => :shell, :privileged => false, :inline => run_tests("xenial64")
   end
 
-  config.vm.define "trusty64" do |b|
-    b.vm.box = "ubuntu/trusty64"
-    b.vm.provider :virtualbox do |v|
-      v.memory = 1024 + $wmem
-    end
-    b.vm.provision "fs init", :type => :shell, :inline => fs_init("vagrant")
-    b.vm.provision "packages debianoid", :type => :shell, :inline => packages_debianoid("vagrant")
-    b.vm.provision "build env", :type => :shell, :privileged => false, :inline => build_sys_venv("trusty64")
-    b.vm.provision "install borg", :type => :shell, :privileged => false, :inline => install_borg(true)
-    b.vm.provision "run tests", :type => :shell, :privileged => false, :inline => run_tests("trusty64")
-  end
-
   config.vm.define "buster64" do |b|
     b.vm.box = "debian/buster64"
     b.vm.provider :virtualbox do |v|
@@ -446,84 +412,23 @@ Vagrant.configure(2) do |config|
     end
     b.vm.provision "fs init", :type => :shell, :inline => fs_init("vagrant")
     b.vm.provision "packages debianoid", :type => :shell, :inline => packages_debianoid("vagrant")
-    b.vm.provision "build env", :type => :shell, :privileged => false, :inline => build_sys_venv("stretch64")
+    b.vm.provision "install pyenv", :type => :shell, :privileged => false, :inline => install_pyenv("stretch64")
+    b.vm.provision "install pythons", :type => :shell, :privileged => false, :inline => install_pythons("stretch64")
+    b.vm.provision "build env", :type => :shell, :privileged => false, :inline => build_pyenv_venv("stretch64")
     b.vm.provision "install borg", :type => :shell, :privileged => false, :inline => install_borg(true)
+    b.vm.provision "install pyinstaller", :type => :shell, :privileged => false, :inline => install_pyinstaller()
+    b.vm.provision "build binary with pyinstaller", :type => :shell, :privileged => false, :inline => build_binary_with_pyinstaller("stretch64")
     b.vm.provision "run tests", :type => :shell, :privileged => false, :inline => run_tests("stretch64")
-  end
-
-  config.vm.define "jessie32" do |b|
-    b.vm.box = "debian8-i386"
-    b.vm.provider :virtualbox do |v|
-      v.memory = 768 + $wmem
-    end
-    b.vm.provision "fs init", :type => :shell, :inline => fs_init("vagrant")
-    b.vm.provision "packages debianoid", :type => :shell, :inline => packages_debianoid("vagrant")
-    b.vm.provision "install pyenv", :type => :shell, :privileged => false, :inline => install_pyenv("jessie32")
-    b.vm.provision "install pythons", :type => :shell, :privileged => false, :inline => install_pythons("jessie32")
-    b.vm.provision "build env", :type => :shell, :privileged => false, :inline => build_pyenv_venv("jessie32")
-    b.vm.provision "install borg", :type => :shell, :privileged => false, :inline => install_borg(true)
-    b.vm.provision "install pyinstaller", :type => :shell, :privileged => false, :inline => install_pyinstaller()
-    b.vm.provision "build binary with pyinstaller", :type => :shell, :privileged => false, :inline => build_binary_with_pyinstaller("jessie32")
-    b.vm.provision "run tests", :type => :shell, :privileged => false, :inline => run_tests("jessie32")
-  end
-
-  config.vm.define "jessie64" do |b|
-    b.vm.box = "debian8-amd64"
-    b.vm.provider :virtualbox do |v|
-      v.memory = 1024 + $wmem
-    end
-    b.vm.provision "fs init", :type => :shell, :inline => fs_init("vagrant")
-    b.vm.provision "packages debianoid", :type => :shell, :inline => packages_debianoid("vagrant")
-    b.vm.provision "install pyenv", :type => :shell, :privileged => false, :inline => install_pyenv("jessie64")
-    b.vm.provision "install pythons", :type => :shell, :privileged => false, :inline => install_pythons("jessie64")
-    b.vm.provision "build env", :type => :shell, :privileged => false, :inline => build_pyenv_venv("jessie64")
-    b.vm.provision "install borg", :type => :shell, :privileged => false, :inline => install_borg(true)
-    b.vm.provision "install pyinstaller", :type => :shell, :privileged => false, :inline => install_pyinstaller()
-    b.vm.provision "build binary with pyinstaller", :type => :shell, :privileged => false, :inline => build_binary_with_pyinstaller("jessie64")
-    b.vm.provision "run tests", :type => :shell, :privileged => false, :inline => run_tests("jessie64")
-  end
-
-  config.vm.define "wheezy32" do |b|
-    b.vm.box = "debian7-i386"
-    b.vm.provider :virtualbox do |v|
-      v.memory = 768 + $wmem
-    end
-    b.vm.provision "fs init", :type => :shell, :inline => fs_init("vagrant")
-    b.vm.provision "packages prepare wheezy", :type => :shell, :inline => packages_prepare_wheezy
-    b.vm.provision "packages debianoid", :type => :shell, :inline => packages_debianoid("vagrant")
-    b.vm.provision "install pyenv", :type => :shell, :privileged => false, :inline => install_pyenv("wheezy32")
-    b.vm.provision "install pythons", :type => :shell, :privileged => false, :inline => install_pythons("wheezy32")
-    b.vm.provision "build env", :type => :shell, :privileged => false, :inline => build_pyenv_venv("wheezy32")
-    b.vm.provision "install borg", :type => :shell, :privileged => false, :inline => install_borg(true)
-    b.vm.provision "install pyinstaller", :type => :shell, :privileged => false, :inline => install_pyinstaller()
-    b.vm.provision "build binary with pyinstaller", :type => :shell, :privileged => false, :inline => build_binary_with_pyinstaller("wheezy32")
-    b.vm.provision "run tests", :type => :shell, :privileged => false, :inline => run_tests("wheezy32")
-  end
-
-  config.vm.define "wheezy64" do |b|
-    b.vm.box = "debian7-amd64"
-    b.vm.provider :virtualbox do |v|
-      v.memory = 1024 + $wmem
-    end
-    b.vm.provision "fs init", :type => :shell, :inline => fs_init("vagrant")
-    b.vm.provision "packages prepare wheezy", :type => :shell, :inline => packages_prepare_wheezy
-    b.vm.provision "packages debianoid", :type => :shell, :inline => packages_debianoid("vagrant")
-    b.vm.provision "install pyenv", :type => :shell, :privileged => false, :inline => install_pyenv("wheezy64")
-    b.vm.provision "install pythons", :type => :shell, :privileged => false, :inline => install_pythons("wheezy64")
-    b.vm.provision "build env", :type => :shell, :privileged => false, :inline => build_pyenv_venv("wheezy64")
-    b.vm.provision "install borg", :type => :shell, :privileged => false, :inline => install_borg(true)
-    b.vm.provision "install pyinstaller", :type => :shell, :privileged => false, :inline => install_pyinstaller()
-    b.vm.provision "build binary with pyinstaller", :type => :shell, :privileged => false, :inline => build_binary_with_pyinstaller("wheezy64")
-    b.vm.provision "run tests", :type => :shell, :privileged => false, :inline => run_tests("wheezy64")
   end
 
   # OS X
   config.vm.define "darwin64" do |b|
-    b.vm.box = "macos1010"
+    b.vm.box = "macos-sierra"
     b.vm.provider :virtualbox do |v|
-      v.memory = 1536 + $wmem
-      v.customize ['modifyvm', :id, '--ostype', 'MacOS1010_64']
+      v.memory = 2048 + $wmem
+      v.customize ['modifyvm', :id, '--ostype', 'MacOS_64']
       v.customize ['modifyvm', :id, '--paravirtprovider', 'default']
+      v.customize ['modifyvm', :id, '--nested-hw-virt', 'on']
       # Adjust CPU settings according to
       # https://github.com/geerlingguy/macos-virtualbox-vm
       v.customize ['modifyvm', :id, '--cpuidset',
@@ -545,7 +450,7 @@ Vagrant.configure(2) do |config|
 
   # BSD
   config.vm.define "freebsd64" do |b|
-    b.vm.box = "freebsd64"  # custom FreeBSD 10.3 box. official ones are broken, #3022.
+    b.vm.box = "freebsd/FreeBSD-11.4-STABLE"
     b.vm.provider :virtualbox do |v|
       v.memory = 1024 + $wmem
     end

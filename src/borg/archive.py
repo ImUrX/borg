@@ -202,6 +202,9 @@ class DownloadPipeline:
         Warning: if *preload* is True then all data chunks of every yielded item have to be retrieved,
         otherwise preloaded chunks will accumulate in RemoteRepository and create a memory leak.
         """
+        def _preload(chunks):
+            self.repository.preload([c.id for c in chunks])
+
         masters_preloaded = set()
         unpacker = msgpack.Unpacker(use_list=False)
         for data in self.fetch_many(ids):
@@ -210,9 +213,6 @@ class DownloadPipeline:
             for item in items:
                 if 'chunks' in item:
                     item.chunks = [ChunkListEntry(*e) for e in item.chunks]
-
-            def preload(chunks):
-                self.repository.preload([c.id for c in chunks])
 
             if filter:
                 items = [item for item in items if filter(item)]
@@ -226,7 +226,7 @@ class DownloadPipeline:
                     # due to a side effect of the filter() call, we now have hardlink_masters dict populated.
                     for item in items:
                         if 'chunks' in item:  # regular file, maybe a hardlink master
-                            preload(item.chunks)
+                            _preload(item.chunks)
                             # if this is a hardlink master, remember that we already preloaded it:
                             if 'source' not in item and hardlinkable(item.mode) and item.get('hardlink_master', True):
                                 masters_preloaded.add(item.path)
@@ -236,13 +236,13 @@ class DownloadPipeline:
                                 # we only need to preload *once* (for the 1st selected slave)
                                 chunks, _ = hardlink_masters[source]
                                 if chunks is not None:
-                                    preload(chunks)
+                                    _preload(chunks)
                                 masters_preloaded.add(source)
                 else:
                     # easy: we do not have a filter, thus all items are selected, thus we need to preload all chunks.
                     for item in items:
                         if 'chunks' in item:
-                            preload(item.chunks)
+                            _preload(item.chunks)
 
             for item in items:
                 yield item
@@ -315,7 +315,8 @@ class Archive:
         """Failed to encode filename "{}" into file system encoding "{}". Consider configuring the LANG environment variable."""
 
     def __init__(self, repository, key, manifest, name, cache=None, create=False,
-                 checkpoint_interval=1800, numeric_owner=False, noatime=False, noctime=False, nobirthtime=False, nobsdflags=False,
+                 checkpoint_interval=1800, numeric_owner=False, noatime=False, noctime=False, nobirthtime=False,
+                 nobsdflags=False, noacls=False, noxattrs=False,
                  progress=False, chunker_params=CHUNKER_PARAMS, start=None, start_monotonic=None, end=None,
                  consider_part_files=False, log_json=False):
         self.cwd = os.getcwd()
@@ -335,6 +336,8 @@ class Archive:
         self.noctime = noctime
         self.nobirthtime = nobirthtime
         self.nobsdflags = nobsdflags
+        self.noacls = noacls
+        self.noxattrs = noxattrs
         assert (start is None) == (start_monotonic is None), 'Logic error: if start is given, start_monotonic must be given as well and vice versa.'
         if start is None:
             start = datetime.utcnow()
@@ -463,6 +466,8 @@ Utilization of max. archive size: {csize_max:.0%}
         return filter(item) if filter else True
 
     def iter_items(self, filter=None, partial_extract=False, preload=False, hardlink_masters=None):
+        # note: when calling this with preload=True, later fetch_many() must be called with
+        # is_preloaded=True or the RemoteRepository code will leak memory!
         assert not (filter and partial_extract and preload) or hardlink_masters is not None
         for item in self.pipeline.unpack_many(self.metadata.items, partial_extract=partial_extract,
                                               preload=preload, hardlink_masters=hardlink_masters,
@@ -509,7 +514,15 @@ Utilization of max. archive size: {csize_max:.0%}
         metadata = ArchiveItem(metadata)
         data = self.key.pack_and_authenticate_metadata(metadata.as_dict(), context=b'archive')
         self.id = self.key.id_hash(data)
-        self.cache.add_chunk(self.id, data, self.stats)
+        try:
+            self.cache.add_chunk(self.id, data, self.stats)
+        except IntegrityError as err:
+            err_msg = str(err)
+            # hack to avoid changing the RPC protocol by introducing new (more specific) exception class
+            if 'More than allowed put data' in err_msg:
+                raise Error('%s - archive too big (issue #1473)!' % err_msg)
+            else:
+                raise
         while self.repository.async_response(wait=True) is not None:
             pass
         self.manifest.archives[name] = (self.id, metadata.time)
@@ -752,36 +765,33 @@ Utilization of max. archive size: {csize_max:.0%}
         except OSError:
             # some systems don't support calling utime on a symlink
             pass
-        acl_set(path, item, self.numeric_owner)
-        # chown removes Linux capabilities, so set the extended attributes at the end, after chown, since they include
-        # the Linux capabilities in the "security.capability" attribute.
-        xattrs = item.get('xattrs', {})
-        for k, v in xattrs.items():
-            try:
-                xattr.setxattr(fd or path, k, v, follow_symlinks=False)
-            except OSError as e:
-                if e.errno == errno.E2BIG:
-                    # xattr is too big
-                    logger.warning('%s: Value or key of extended attribute %s is too big for this filesystem' %
-                                   (path, k.decode()))
+        if not self.noacls:
+            acl_set(path, item, self.numeric_owner)
+        if not self.noxattrs:
+            # chown removes Linux capabilities, so set the extended attributes at the end, after chown, since they include
+            # the Linux capabilities in the "security.capability" attribute.
+            xattrs = item.get('xattrs', {})
+            for k, v in xattrs.items():
+                try:
+                    xattr.setxattr(fd or path, k, v, follow_symlinks=False)
+                except OSError as e:
+                    msg_format = '%s: when setting extended attribute %s: %%s' % (path, k.decode())
+                    if e.errno == errno.E2BIG:
+                        err_str = 'too big for this filesystem'
+                    elif e.errno == errno.ENOTSUP:
+                        err_str = 'xattrs not supported on this filesystem'
+                    elif e.errno == errno.ENOSPC:
+                        # no space left on device while setting this specific xattr
+                        # ext4 reports ENOSPC when trying to set an xattr with >4kiB while ext4 can only support 4kiB xattrs
+                        # (in this case, this is NOT a "disk full" error, just a ext4 limitation).
+                        err_str = 'no space left on device [xattr len = %d]' % (len(v), )
+                    else:
+                        # generic handler
+                        # EACCES: permission denied to set this specific xattr (this may happen related to security.* keys)
+                        # EPERM: operation not permitted
+                        err_str = os.strerror(e.errno)
+                    logger.warning(msg_format % err_str)
                     set_ec(EXIT_WARNING)
-                elif e.errno == errno.ENOTSUP:
-                    # xattrs not supported here
-                    logger.warning('%s: Extended attributes are not supported on this filesystem' % path)
-                    set_ec(EXIT_WARNING)
-                elif e.errno == errno.EACCES:
-                    # permission denied to set this specific xattr (this may happen related to security.* keys)
-                    logger.warning('%s: Permission denied when setting extended attribute %s' % (path, k.decode()))
-                    set_ec(EXIT_WARNING)
-                elif e.errno == errno.ENOSPC:
-                    # no space left on device while setting this specific xattr
-                    # ext4 reports ENOSPC when trying to set an xattr with >4kiB while ext4 can only support 4kiB xattrs
-                    # (in this case, this is NOT a "disk full" error, just a ext4 limitation).
-                    logger.warning('%s: No space left on device while setting extended attribute %s (len = %d)' % (
-                        path, k.decode(), len(v)))
-                    set_ec(EXIT_WARNING)
-                else:
-                    raise
         # bsdflags include the immutable flag and need to be set last:
         if not self.nobsdflags and 'bsdflags' in item:
             try:
@@ -902,12 +912,11 @@ Utilization of max. archive size: {csize_max:.0%}
 
     def stat_ext_attrs(self, st, path):
         attrs = {}
-        bsdflags = 0
         with backup_io('extended stat'):
-            xattrs = xattr.get_all(path, follow_symlinks=False)
-            if not self.nobsdflags:
-                bsdflags = get_flags(path, st)
-            acl_get(path, attrs, st, self.numeric_owner)
+            xattrs = {} if self.noxattrs else xattr.get_all(path, follow_symlinks=False)
+            bsdflags = 0 if self.nobsdflags else get_flags(path, st)
+            if not self.noacls:
+                acl_get(path, attrs, st, self.numeric_owner)
         if xattrs:
             attrs['xattrs'] = StableDict(xattrs)
         if bsdflags:
@@ -1017,14 +1026,19 @@ Utilization of max. archive size: {csize_max:.0%}
                 for chunk in item.chunks:
                     cache.chunk_incref(chunk.id, dummy_stats, size=chunk.size)
 
-    def process_stdin(self, path, cache):
-        uid, gid = 0, 0
+    def process_stdin(self, path, cache, mode, user, group):
+        uid = user2uid(user)
+        if uid is None:
+            raise Error("no such user: %s" % user)
+        gid = group2gid(group)
+        if gid is None:
+            raise Error("no such group: %s" % group)
         t = int(time.time()) * 1000000000
         item = Item(
             path=path,
-            mode=0o100660,  # regular file, ug=rw
-            uid=uid, user=uid2user(uid),
-            gid=gid, group=gid2group(gid),
+            mode=mode & 0o107777 | 0o100000,  # forcing regular file mode
+            uid=uid, user=user,
+            gid=gid, group=group,
             mtime=t, atime=t, ctime=t,
         )
         fd = sys.stdin.buffer  # binary
@@ -1038,15 +1052,21 @@ Utilization of max. archive size: {csize_max:.0%}
         with self.create_helper(path, st, None) as (item, status, hardlinked, hardlink_master):  # no status yet
             item.update(self.stat_simple_attrs(st))
             is_special_file = is_special(st.st_mode)
+            if is_special_file:
+                # we process a special file like a regular file. reflect that in mode,
+                # so it can be extracted / accessed in FUSE mount like a regular file.
+                # this needs to be done early, so that part files also get the patched mode.
+                item.mode = stat.S_IFREG | stat.S_IMODE(item.mode)
             if not hardlinked or hardlink_master:
                 if not is_special_file:
-                    path_hash = self.key.id_hash(safe_encode(os.path.join(self.cwd, path)))
-                    known, ids = cache.file_known_and_unchanged(path_hash, st)
+                    hashed_path = safe_encode(os.path.join(self.cwd, path))
+                    path_hash = self.key.id_hash(hashed_path)
+                    known, ids = cache.file_known_and_unchanged(hashed_path, path_hash, st)
                 else:
                     # in --read-special mode, we may be called for special files.
                     # there should be no information in the cache about special files processed in
                     # read-special mode, but we better play safe as this was wrong in the past:
-                    path_hash = None
+                    hashed_path = path_hash = None
                     known, ids = False, None
                 chunks = None
                 if ids is not None:
@@ -1072,14 +1092,10 @@ Utilization of max. archive size: {csize_max:.0%}
                     if not is_special_file:
                         # we must not memorize special files, because the contents of e.g. a
                         # block or char device will change without its mtime/size/inode changing.
-                        cache.memorize_file(path_hash, st, [c.id for c in item.chunks])
+                        cache.memorize_file(hashed_path, path_hash, st, [c.id for c in item.chunks])
                 self.stats.nfiles += 1
             item.update(self.stat_ext_attrs(st, path))
             item.get_size(memorize=True)
-            if is_special_file:
-                # we processed a special file like a regular file. reflect that in mode,
-                # so it can be extracted / accessed in FUSE mount like a regular file:
-                item.mode = stat.S_IFREG | stat.S_IMODE(item.mode)
             return status
 
     @staticmethod
@@ -1841,24 +1857,33 @@ class ArchiveRecreater:
         matcher = self.matcher
         tag_files = []
         tagged_dirs = []
-        # build hardlink masters, but only for paths ending in CACHE_TAG_NAME, so we can read hard-linked TAGs
+
+        # to support reading hard-linked CACHEDIR.TAGs (aka CACHE_TAG_NAME), similar to hardlink_masters:
         cachedir_masters = {}
 
+        if self.exclude_caches:
+            # sadly, due to how CACHEDIR.TAG works (filename AND file [header] contents) and
+            # how borg deals with hardlinks (slave hardlinks referring back to master hardlinks),
+            # we need to pass over the archive collecting hardlink master paths.
+            # as seen in issue #4911, the master paths can have an arbitrary filenames,
+            # not just CACHEDIR.TAG.
+            for item in archive.iter_items(filter=lambda item: os.path.basename(item.path) == CACHE_TAG_NAME):
+                if stat.S_ISREG(item.mode) and 'chunks' not in item and 'source' in item:
+                    # this is a hardlink slave, referring back to its hardlink master (via item.source)
+                    cachedir_masters[item.source] = None  # we know the key (path), but not the value (item) yet
+
         for item in archive.iter_items(
-                filter=lambda item: item.path.endswith(CACHE_TAG_NAME) or matcher.match(item.path)):
-            if item.path.endswith(CACHE_TAG_NAME):
+                filter=lambda item: os.path.basename(item.path) == CACHE_TAG_NAME or matcher.match(item.path)):
+            if self.exclude_caches and item.path in cachedir_masters:
                 cachedir_masters[item.path] = item
             dir, tag_file = os.path.split(item.path)
             if tag_file in self.exclude_if_present:
                 exclude(dir, item)
-            if stat.S_ISREG(item.mode):
-                if self.exclude_caches and tag_file == CACHE_TAG_NAME:
-                    if 'chunks' in item:
-                        file = open_item(archive, item)
-                    else:
-                        file = open_item(archive, cachedir_masters[item.source])
-                    if file.read(len(CACHE_TAG_CONTENTS)).startswith(CACHE_TAG_CONTENTS):
-                        exclude(dir, item)
+            elif self.exclude_caches and tag_file == CACHE_TAG_NAME and stat.S_ISREG(item.mode):
+                content_item = item if 'chunks' in item else cachedir_masters[item.source]
+                file = open_item(archive, content_item)
+                if file.read(len(CACHE_TAG_CONTENTS)) == CACHE_TAG_CONTENTS:
+                    exclude(dir, item)
         matcher.add(tag_files, IECommand.Include)
         matcher.add(tagged_dirs, IECommand.ExcludeNoRecurse)
 

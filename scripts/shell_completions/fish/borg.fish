@@ -92,13 +92,17 @@ complete -c borg -f      -l 'storage-quota'         -d 'Set storage QUOTA of the
 complete -c borg -f      -l 'make-parent-dirs'      -d 'Create parent directories'                  -n "__fish_seen_subcommand_from init"
 
 # borg create options
-complete -c borg -f -s n -l 'dry-run'               -d 'Do not change the repository'               -n "__fish_seen_subcommand_from create"
-complete -c borg -f -s s -l 'stats'                 -d 'Print verbose statistics'                   -n "__fish_seen_subcommand_from create"
-complete -c borg -f      -l 'list'                  -d 'Print verbose list of items'                -n "__fish_seen_subcommand_from create"
-complete -c borg -f      -l 'filter'                -d 'Only items with given STATUSCHARS'          -n "__fish_seen_subcommand_from create"
-complete -c borg -f      -l 'json'                  -d 'Print verbose stats as json'                -n "__fish_seen_subcommand_from create"
-complete -c borg -f      -l 'no-cache-sync'         -d 'Do not synchronize the cache'               -n "__fish_seen_subcommand_from create"
-complete -c borg -f      -l 'stdin-name'            -d 'Use NAME in archive for stdin data'         -n "__fish_seen_subcommand_from create"
+complete -c borg -f -s n -l 'dry-run'               -d 'Do not change the repository'                       -n "__fish_seen_subcommand_from create"
+complete -c borg -f -s s -l 'stats'                 -d 'Print verbose statistics'                           -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'list'                  -d 'Print verbose list of items'                        -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'filter'                -d 'Only items with given STATUSCHARS'                  -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'json'                  -d 'Print verbose stats as json'                        -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'no-cache-sync'         -d 'Do not synchronize the cache'                       -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'stdin-name'            -d 'Use NAME in archive for stdin data'                 -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'stdin-user'            -d 'Set user USER in archive for stdin data [root]'     -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'stdin-group'           -d 'Set group GROUP in archive for stdin data [root]'   -n "__fish_seen_subcommand_from create"
+complete -c borg -f      -l 'stdin-mode'            -d 'Set mode to M in archive for stdin data [0660]'     -n "__fish_seen_subcommand_from create"
+
 # Exclusion options
 complete -c borg    -s e -l 'exclude'               -d 'Exclude paths matching PATTERN'             -n "__fish_seen_subcommand_from create"
 complete -c borg         -l 'exclude-from'          -d 'Read exclude patterns from EXCLUDEFILE'     -n "__fish_seen_subcommand_from create"
@@ -288,7 +292,7 @@ complete -c borg -f      -l 'comment'               -d 'Add COMMENT to the archi
 complete -c borg -f      -l 'timestamp'             -d 'Set creation TIME (yyyy-mm-ddThh:mm:ss)'    -n "__fish_seen_subcommand_from recreate"
 complete -c borg         -l 'timestamp'             -d 'Set creation time using reference FILE'     -n "__fish_seen_subcommand_from recreate"
 complete -c borg -f -s C -l 'compression'           -d 'Select compression ALGORITHM,LEVEL [lz4]' -a "$compression_methods" -n "__fish_seen_subcommand_from recreate"
-set -l recompress_when "if-different always"
+set -l recompress_when "if-different always never"
 complete -c borg -f      -l 'recompress'            -d 'Recompress chunks CONDITION' -a "$recompress_when" -n "__fish_seen_subcommand_from recreate"
 complete -c borg -f      -l 'chunker-params'        -d 'Chunker PARAMETERS [19,23,21,4095]'         -n "__fish_seen_subcommand_from recreate"
 
@@ -325,29 +329,68 @@ complete -c borg -f      -l 'list'                  -d 'List the configuration o
 # borg help
 # no specific options
 
-# List archives
 
-function __fish_borg_is_repository
-    return (string match --quiet --regex '.*::' '"'(commandline --current-token)'"')
+# List repositories::archives
+
+function __fish_borg_is_argument_n --description 'Test if current argument is on Nth place' --argument n
+    set tokens (commandline --current-process --tokenize --cut-at-cursor)
+    set -l tokencount 0
+    for token in $tokens
+        switch $token
+            case '-*'
+                # ignore command line switches
+            case '*'
+                set tokencount (math $tokencount+1)
+        end
+    end
+    return (test $tokencount -eq $n)
 end
 
-function __fish_borg_list_archives
-    set -l repository_name (string replace --regex '::.*' '' (commandline --current-token))
-    borg list --format="$repository_name::{archive}{NEWLINE}" "$repository_name" ^/dev/null
+function __fish_borg_is_dir_a_repository
+    set -l config_content
+    if test -f $argv[1]/README
+    and test -f $argv[1]/config
+        read config_content < $argv[1]/config ^/dev/null
+    end
+    return (string match --quiet '[repository]' $config_content)
 end
 
-complete -c borg -f -n __fish_borg_is_repository -a '(__fish_borg_list_archives)'
+function __fish_borg_list_repos_or_archives
+    if string match --quiet --regex '.*::' '"'(commandline --current-token)'"'
+        # If the current token contains "::" then list the archives:
+        set -l repository_name (string replace --regex '::.*' '' (commandline --current-token))
+        borg list --format="$repository_name::{archive}{TAB}{comment}{NEWLINE}" "$repository_name" ^/dev/null
+    else
+        # Otherwise list the repositories, directories and user@host entries:
+        set -l directories (commandline --cut-at-cursor --current-token)*/
+        for directoryname in $directories
+            if __fish_borg_is_dir_a_repository $directoryname
+                printf '%s::\t%s\n' (string trim --right --chars='/' $directoryname) "Repository"
+            else
+                printf '%s\n' $directoryname
+            end
+        end
+        __fish_complete_user_at_hosts | string replace --regex '$' ':'
+    end
+end
 
-# Second archive listing for borg diff
+complete -c borg -f -n "__fish_borg_is_argument_n 2" -a '(__fish_borg_list_repos_or_archives)'
+
+
+# Additional archive listings
 
 function __fish_borg_is_diff_second_archive
     return (string match --quiet --regex ' diff .*::[^ ]+ '(commandline --current-token)'$' (commandline))
 end
 
-function __fish_borg_list_diff_archives
-    set -l repository_name (string match --regex '[^ ]*::' (commandline))
-    set -l repository_name (string replace '::' '' $repository_name)
-    borg list --format="{archive}{NEWLINE}" "$repository_name" ^/dev/null
+function __fish_borg_is_delete_additional_archive
+    return (string match --quiet --regex ' delete .*::[^ ]+ ' (commandline))
 end
 
-complete -c borg -f -n __fish_borg_is_diff_second_archive -a '(__fish_borg_list_diff_archives)'
+function __fish_borg_list_only_archives
+    set -l repo_matches (string match --regex '([^ ]*)::' (commandline))
+    borg list --format="{archive}{TAB}{comment}{NEWLINE}" "$repo_matches[2]" ^/dev/null
+end
+
+complete -c borg -f -n __fish_borg_is_diff_second_archive -a '(__fish_borg_list_only_archives)'
+complete -c borg -f -n __fish_borg_is_delete_additional_archive -a '(__fish_borg_list_only_archives)'

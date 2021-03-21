@@ -1,6 +1,6 @@
 .\" Man page generated from reStructuredText.
 .
-.TH BORG-CREATE 1 "2020-03-07" "" "borg backup tool"
+.TH BORG-CREATE 1 "2020-12-24" "" "borg backup tool"
 .SH NAME
 borg-create \- Create new archive
 .
@@ -41,7 +41,8 @@ that means if relative paths are desired, the command has to be run from the cor
 directory.
 .sp
 When giving \(aq\-\(aq as path, borg will read data from standard input and create a
-file \(aqstdin\(aq in the created archive from that data.
+file \(aqstdin\(aq in the created archive from that data. See section \fIReading from
+stdin\fP below for details.
 .sp
 The archive will consume almost no disk space for files or parts of files that
 have already been stored in other archives.
@@ -92,6 +93,7 @@ ctime is a rather safe way to detect changes to a file (metadata and contents)
 as it can not be set from userspace. But, a metadata\-only change will already
 update the ctime, so there might be some unnecessary chunking/hashing even
 without content changes. Some filesystems do not support ctime (change time).
+E.g. doing a chown or chmod to a file will change its ctime.
 .IP \(bu 2
 mtime usually works and only updates if file contents were changed. But mtime
 can be arbitrarily set from userspace, e.g. to set mtime back to the same value
@@ -115,6 +117,7 @@ the state after creation. Also, the \fB\-\-stats\fP and \fB\-\-dry\-run\fP optio
 exclusive because the data is not actually compressed and deduplicated during a dry run.
 .sp
 See the output of the "borg help patterns" command for more help on exclude patterns.
+.sp
 See the output of the "borg help placeholders" command for more help on placeholders.
 .SH OPTIONS
 .sp
@@ -154,11 +157,20 @@ do not load/update the file metadata cache used to detect unchanged files
 .TP
 .BI \-\-stdin\-name \ NAME
 use NAME in archive for stdin data (default: "stdin")
+.TP
+.BI \-\-stdin\-user \ USER
+set user USER in archive for stdin data (default: \(aqroot\(aq)
+.TP
+.BI \-\-stdin\-group \ GROUP
+set group GROUP in archive for stdin data (default: \(aqroot\(aq)
+.TP
+.BI \-\-stdin\-mode \ M
+set mode to M in archive for stdin data (default: 0660)
 .UNINDENT
 .SS Exclusion options
 .INDENT 0.0
 .TP
-.BI \-e \ PATTERN\fP,\fB \ \-\-exclude \ PATTERN
+.BI \-e \ PATTERN\fR,\fB \ \-\-exclude \ PATTERN
 exclude paths matching PATTERN
 .TP
 .BI \-\-exclude\-from \ EXCLUDEFILE
@@ -186,7 +198,7 @@ exclude files flagged NODUMP
 .INDENT 0.0
 .TP
 .B \-x\fP,\fB  \-\-one\-file\-system
-stay in the same file system and do not store mount points of other file systems
+stay in the same file system and do not store mount points of other file systems.  This might behave different from your expectations, see the docs.
 .TP
 .B \-\-numeric\-owner
 only store numeric user and group identifiers
@@ -221,13 +233,13 @@ add a comment text to the archive
 .BI \-\-timestamp \ TIMESTAMP
 manually specify the archive creation date/time (UTC, yyyy\-mm\-ddThh:mm:ss format). Alternatively, give a reference file/directory.
 .TP
-.BI \-c \ SECONDS\fP,\fB \ \-\-checkpoint\-interval \ SECONDS
+.BI \-c \ SECONDS\fR,\fB \ \-\-checkpoint\-interval \ SECONDS
 write checkpoint every SECONDS seconds (Default: 1800)
 .TP
 .BI \-\-chunker\-params \ PARAMS
 specify the chunker parameters (CHUNK_MIN_EXP, CHUNK_MAX_EXP, HASH_MASK_BITS, HASH_WINDOW_SIZE). default: 19,23,21,4095
 .TP
-.BI \-C \ COMPRESSION\fP,\fB \ \-\-compression \ COMPRESSION
+.BI \-C \ COMPRESSION\fR,\fB \ \-\-compression \ COMPRESSION
 select compression algorithm, see the output of the "borg help compression" command for details.
 .UNINDENT
 .SH EXAMPLES
@@ -318,6 +330,17 @@ all of its contents will be omitted from the backup.  If, however, you wish to
 only include the objects specified by \fB\-\-exclude\-if\-present\fP in your backup,
 and not include any other contents of the containing folder, this can be enabled
 through using the \fB\-\-keep\-exclude\-tags\fP option.
+.sp
+The \fB\-x\fP or \fB\-\-one\-file\-system\fP option excludes directories, that are mountpoints (and everything in them).
+It detects mountpoints by comparing the device number from the output of \fBstat()\fP of the directory and its
+parent directory. Specifically, it excludes directories for which \fBstat()\fP reports a device number different
+from the device number of their parent. Be aware that in Linux (and possibly elsewhere) there are directories
+with device number different from their parent, which the kernel does not consider a mountpoint and also the
+other way around. Examples are bind mounts (possibly same device number, but always a mountpoint) and ALL
+subvolumes of a btrfs (different device number from parent but not necessarily a mountpoint). Therefore when
+using \fB\-\-one\-file\-system\fP, one should make doubly sure that the backup works as intended especially when using
+btrfs. This is even more important, if the btrfs layout was created by someone else, e.g. a distribution
+installer.
 .SS Item flags
 .sp
 \fB\-\-list\fP outputs a list of all files, directories and other
@@ -372,6 +395,31 @@ Other flags used include:
 .IP \(bu 2
 \(aq?\(aq = missing status code (if you see this, please file a bug report!)
 .UNINDENT
+.SS Reading from stdin
+.sp
+To read from stdin, specify \fB\-\fP as path and pipe directly to borg:
+.INDENT 0.0
+.INDENT 3.5
+.sp
+.nf
+.ft C
+backup\-vm \-\-id myvm \-\-stdout | borg create REPO::ARCHIVE \-
+.ft P
+.fi
+.UNINDENT
+.UNINDENT
+.sp
+Note that piping to borg creates an archive even if the command piping
+to borg exits with a failure. In this case, \fBone can end up with
+truncated output being backed up\fP\&.
+.sp
+Reading from stdin yields just a stream of data without file metadata
+associated with it, and the files cache is not needed at all. So it is
+safe to disable it via \fB\-\-no\-files\-cache\fP and speed up backup
+creation a bit.
+.sp
+By default, the content read from stdin is stored in a file called \(aqstdin\(aq.
+Use \fB\-\-stdin\-name\fP to change the name.
 .SH SEE ALSO
 .sp
 \fIborg\-common(1)\fP, \fIborg\-delete(1)\fP, \fIborg\-prune(1)\fP, \fIborg\-check(1)\fP, \fIborg\-patterns(1)\fP, \fIborg\-placeholders(1)\fP, \fIborg\-compression(1)\fP

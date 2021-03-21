@@ -28,6 +28,7 @@ from datetime import datetime, timezone, timedelta
 from functools import partial, lru_cache
 from itertools import islice
 from operator import attrgetter
+from os import scandir
 from string import Formatter
 from shutil import get_terminal_size
 
@@ -278,6 +279,10 @@ class Archives(abc.MutableMapping):
         Apply *first* and *last* filters, and then possibly *reverse* the list.
 
         *sort_by* is a list of sort keys applied in reverse order.
+
+        Note: for better robustness, all filtering / limiting parameters must default to
+              "not limit / not filter", so a FULL archive list is produced by a simple .list().
+              some callers EXPECT to iterate over all archives in a repo for correct operation.
         """
         if isinstance(sort_by, (str, bytes)):
             raise TypeError('sort_by must be a sequence of str')
@@ -605,7 +610,7 @@ def timestamp(s):
     try:
         # is it pointing to a file / directory?
         ts = safe_s(os.stat(s).st_mtime)
-        return datetime.utcfromtimestamp(ts)
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
     except OSError:
         # didn't work, try parsing as timestamp. UTC, no TZ, no microsecs support.
         for format in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S+00:00',
@@ -614,7 +619,7 @@ def timestamp(s):
                        '%Y-%m-%d', '%Y-%j',
                        ):
             try:
-                return datetime.strptime(s, format)
+                return datetime.strptime(s, format).replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
         raise ValueError
@@ -717,7 +722,7 @@ def format_line(format, data):
         raise PlaceholderError(format, data, e.__class__.__name__, str(e))
 
 
-def replace_placeholders(text):
+def replace_placeholders(text, overrides={}):
     """Replace placeholders in text with their values."""
     from .platform import fqdn, hostname
     current_time = datetime.now(timezone.utc)
@@ -734,6 +739,7 @@ def replace_placeholders(text):
         'borgmajor': '%d' % borg_version_tuple[:1],
         'borgminor': '%d.%d' % borg_version_tuple[:2],
         'borgpatch': '%d.%d.%d' % borg_version_tuple[:3],
+        **overrides,
     }
     return format_line(text, data)
 
@@ -1102,13 +1108,13 @@ class Location:
         |                                                   # or
         """ + optional_archive_re, re.VERBOSE)              # archive name (optional, may be empty)
 
-    def __init__(self, text=''):
-        if not self.parse(text):
+    def __init__(self, text='', overrides={}):
+        if not self.parse(text, overrides):
             raise ValueError('Invalid location format: "%s"' % self.orig)
 
-    def parse(self, text):
+    def parse(self, text, overrides={}):
         self.orig = text
-        text = replace_placeholders(text)
+        text = replace_placeholders(text, overrides)
         valid = self._parse(text)
         if valid:
             return True
@@ -1200,6 +1206,12 @@ class Location:
                                            self._host,  # needed for ipv6 addrs
                                            ':{}'.format(self.port) if self.port else '',
                                            path)
+
+    def with_timestamp(self, timestamp):
+        return Location(self.orig, overrides={
+            'now': DatetimeWrapper(timestamp.astimezone(None)),
+            'utcnow': DatetimeWrapper(timestamp),
+        })
 
 
 def location_validator(archive=None, proto=None):
@@ -1351,8 +1363,9 @@ def is_slow_msgpack():
 
 def is_supported_msgpack():
     # DO NOT CHANGE OR REMOVE! See also requirements and comments in setup.py.
-    return (0, 4, 6) <= msgpack.version <= (0, 5, 6) and \
-           msgpack.version not in [(0, 5, 0), (0, 5, 2), (0, 5, 3), (0, 5, 5)]
+    v = msgpack.version[:3]
+    return (0, 4, 6) <= v <= (0, 5, 6) and \
+           v not in [(0, 5, 0), (0, 5, 2), (0, 5, 3), (0, 5, 5)]
 
 
 FALSISH = ('No', 'NO', 'no', 'N', 'n', '0', )
@@ -2134,68 +2147,6 @@ def consume(iterator, n=None):
         # advance to the empty slice starting at position n
         next(islice(iterator, n, n), None)
 
-# GenericDirEntry, scandir_generic (c) 2012 Ben Hoyt
-# from the python-scandir package (3-clause BSD license, just like us, so no troubles here)
-# note: simplified version
-
-
-class GenericDirEntry:
-    __slots__ = ('name', '_scandir_path', '_path')
-
-    def __init__(self, scandir_path, name):
-        self._scandir_path = scandir_path
-        self.name = name
-        self._path = None
-
-    @property
-    def path(self):
-        if self._path is None:
-            self._path = os.path.join(self._scandir_path, self.name)
-        return self._path
-
-    def stat(self, follow_symlinks=True):
-        assert not follow_symlinks
-        return os.stat(self.path, follow_symlinks=follow_symlinks)
-
-    def _check_type(self, type):
-        st = self.stat(False)
-        return stat.S_IFMT(st.st_mode) == type
-
-    def is_dir(self, follow_symlinks=True):
-        assert not follow_symlinks
-        return self._check_type(stat.S_IFDIR)
-
-    def is_file(self, follow_symlinks=True):
-        assert not follow_symlinks
-        return self._check_type(stat.S_IFREG)
-
-    def is_symlink(self):
-        return self._check_type(stat.S_IFLNK)
-
-    def inode(self):
-        st = self.stat(False)
-        return st.st_ino
-
-    def __repr__(self):
-        return '<{0}: {1!r}>'.format(self.__class__.__name__, self.path)
-
-
-def scandir_generic(path='.'):
-    """Like os.listdir(), but yield DirEntry objects instead of returning a list of names."""
-    for name in os.listdir(path):
-        yield GenericDirEntry(path, name)
-
-
-try:
-    from os import scandir
-except ImportError:
-    try:
-        # Try python-scandir on Python 3.4
-        from scandir import scandir
-    except ImportError:
-        # If python-scandir is not installed, then use a version that is just as slow as listdir.
-        scandir = scandir_generic
-
 
 def scandir_keyfunc(dirent):
     try:
@@ -2469,7 +2420,7 @@ def prepare_subprocess_env(system, env=None):
         # (non-matching) libraries from there.
         # thus we install the original LDLP, before pyinstaller has modified it:
         lp_key = 'LD_LIBRARY_PATH'
-        lp_orig = env.get(lp_key + '_ORIG')  # pyinstaller >= 20160820 / v3.2.1 has this
+        lp_orig = env.get(lp_key + '_ORIG')
         if lp_orig is not None:
             env[lp_key] = lp_orig
         else:

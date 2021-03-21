@@ -24,7 +24,7 @@ try:
     import tarfile
     import textwrap
     import time
-    from binascii import unhexlify
+    from binascii import unhexlify, hexlify
     from contextlib import contextmanager
     from datetime import datetime, timedelta
     from itertools import zip_longest
@@ -45,7 +45,7 @@ try:
     from .compress import CompressionSpec
     from .crypto.key import key_creator, key_argument_names, tam_required_file, tam_required, RepoKey, PassphraseKey
     from .crypto.keymanager import KeyManager
-    from .helpers import EXIT_SUCCESS, EXIT_WARNING, EXIT_ERROR
+    from .helpers import EXIT_SUCCESS, EXIT_WARNING, EXIT_ERROR, EXIT_SIGNAL_BASE
     from .helpers import Error, NoManifestError, set_ec
     from .helpers import positive_int_validator, location_validator, archivename_validator, ChunkerParams, Location
     from .helpers import PrefixSpec, GlobSpec, CommentSpec, SortBySpec, HUMAN_SORT_KEYS, FilesCacheMode
@@ -71,6 +71,7 @@ try:
     from .helpers import dash_open
     from .helpers import umount
     from .helpers import msgpack, msgpack_fallback
+    from .helpers import uid2user, gid2group
     from .nanorst import rst_to_terminal
     from .patterns import ArgparsePatternAction, ArgparseExcludeFileAction, ArgparsePatternFileAction, parse_exclude_pattern
     from .patterns import PatternMatcher
@@ -184,6 +185,8 @@ def with_archive(method):
         archive = Archive(repository, key, manifest, args.location.archive,
                           numeric_owner=getattr(args, 'numeric_owner', False),
                           nobsdflags=getattr(args, 'nobsdflags', False),
+                          noacls=getattr(args, 'noacls', False),
+                          noxattrs=getattr(args, 'noxattrs', False),
                           cache=kwargs.get('cache'),
                           consider_part_files=args.consider_part_files, log_json=args.log_json)
         return method(self, args, repository=repository, manifest=manifest, key=key, archive=archive, **kwargs)
@@ -198,7 +201,7 @@ def parse_storage_quota(storage_quota):
 
 
 def get_func(args):
-    # This works around http://bugs.python.org/issue9351
+    # This works around https://bugs.python.org/issue9351
     # func is used at the leaf parsers of the argparse parser tree,
     # fallback_func at next level towards the root,
     # fallback2_func at the 2nd next level (which is root in our case).
@@ -323,8 +326,10 @@ class Archiver:
     def do_check(self, args, repository):
         """Check repository consistency"""
         if args.repair:
-            msg = ("'check --repair' is an experimental feature that might result in data loss." +
-                   "\n" +
+            msg = ("This is a potentially dangerous function.\n"
+                   "check --repair might lead to data loss (for kinds of corruption it is not\n"
+                   "capable of dealing with). BE VERY CAREFUL!\n"
+                   "\n"
                    "Type 'YES' if you understand this and want to continue: ")
             if not yes(msg, false_msg="Aborting.", invalid_msg="Invalid answer, aborting.",
                        truish=('YES', ), retry=False,
@@ -522,9 +527,12 @@ class Archiver:
             for path in args.paths:
                 if path == '-':  # stdin
                     path = args.stdin_name
+                    mode = args.stdin_mode
+                    user = args.stdin_user
+                    group = args.stdin_group
                     if not dry_run:
                         try:
-                            status = archive.process_stdin(path, cache)
+                            status = archive.process_stdin(path, cache, mode, user, group)
                         except BackupOSError as e:
                             status = 'E'
                             self.print_warning('%s: %s', path, e)
@@ -545,6 +553,9 @@ class Archiver:
                 self._process(archive, cache, matcher, args.exclude_caches, args.exclude_if_present,
                               args.keep_exclude_tags, skip_inodes, path, restrict_dev,
                               read_special=args.read_special, dry_run=dry_run, st=st)
+                # if we get back here, we've finished recursing into <path>,
+                # we do not ever want to get back in there (even if path is given twice as recursion root)
+                skip_inodes.add((st.st_ino, st.st_dev))
             if not dry_run:
                 archive.save(comment=args.comment, timestamp=args.timestamp)
                 if args.progress:
@@ -578,7 +589,7 @@ class Archiver:
                 archive = Archive(repository, key, manifest, args.location.archive, cache=cache,
                                   create=True, checkpoint_interval=args.checkpoint_interval,
                                   numeric_owner=args.numeric_owner, noatime=args.noatime, noctime=args.noctime, nobirthtime=args.nobirthtime,
-                                  nobsdflags=args.nobsdflags, progress=args.progress,
+                                  nobsdflags=args.nobsdflags, noacls=args.noacls, noxattrs=args.noxattrs, progress=args.progress,
                                   chunker_params=args.chunker_params, start=t0, start_monotonic=t0_monotonic,
                                   log_json=args.log_json)
                 create_inner(archive, cache)
@@ -882,7 +893,7 @@ class Archiver:
 
         # The | (pipe) symbol instructs tarfile to use a streaming mode of operation
         # where it never seeks on the passed fileobj.
-        tar = tarfile.open(fileobj=tarstream, mode='w|')
+        tar = tarfile.open(fileobj=tarstream, mode='w|', format=tarfile.GNU_FORMAT)
 
         self._export_tar(args, archive, tar)
 
@@ -916,8 +927,8 @@ class Archiver:
         hardlink_masters = {} if partial_extract else None
 
         def peek_and_store_hardlink_masters(item, matched):
-            if (partial_extract and not matched and hardlinkable(item.mode) and
-                    item.get('hardlink_master', True) and 'source' not in item):
+            if ((partial_extract and not matched and hardlinkable(item.mode)) and
+                    (item.get('hardlink_master', True) and 'source' not in item)):
                 hardlink_masters[item.get('path')] = (item.get('chunks'), None)
 
         filter = self.build_filter(matcher, peek_and_store_hardlink_masters, strip_components)
@@ -934,7 +945,8 @@ class Archiver:
             """
             Return a file-like object that reads from the chunks of *item*.
             """
-            chunk_iterator = archive.pipeline.fetch_many([chunk_id for chunk_id, _, _ in item.chunks])
+            chunk_iterator = archive.pipeline.fetch_many([chunk_id for chunk_id, _, _ in item.chunks],
+                                                         is_preloaded=True)
             if pi:
                 info = [remove_surrogates(item.path)]
                 return ChunkIteratorFileWrapper(chunk_iterator,
@@ -1018,7 +1030,8 @@ class Archiver:
                 return None, stream
             return tarinfo, stream
 
-        for item in archive.iter_items(filter, preload=True, hardlink_masters=hardlink_masters):
+        for item in archive.iter_items(filter, partial_extract=partial_extract,
+                                       preload=True, hardlink_masters=hardlink_masters):
             orig_path = item.path
             if strip_components:
                 item.path = os.sep.join(orig_path.split(os.sep)[strip_components:])
@@ -1074,11 +1087,11 @@ class Archiver:
             # regular file is replaced with a link or vice versa, it is
             # indicated in compare_mode instead.
             if item1.get('deleted'):
-                return 'added link'
+                return ({"type": 'added link'}, 'added link')
             elif item2.get('deleted'):
-                return 'removed link'
+                return ({"type": 'removed link'}, 'removed link')
             elif 'source' in item1 and 'source' in item2 and item1.source != item2.source:
-                return 'changed link'
+                return ({"type": 'changed link'}, 'changed link')
 
         def contents_changed(item1, item2):
             if item1.get('deleted') != item2.get('deleted'):
@@ -1098,35 +1111,41 @@ class Archiver:
         def compare_content(path, item1, item2):
             if contents_changed(item1, item2):
                 if item1.get('deleted'):
-                    return 'added {:>13}'.format(format_file_size(sum_chunk_size(item2)))
+                    sz = sum_chunk_size(item2)
+                    return ({"type": "added", "size": sz}, 'added {:>13}'.format(format_file_size(sz)))
                 if item2.get('deleted'):
-                    return 'removed {:>11}'.format(format_file_size(sum_chunk_size(item1)))
+                    sz = sum_chunk_size(item1)
+                    return ({"type": "removed", "size": sz}, 'removed {:>11}'.format(format_file_size(sz)))
                 if not can_compare_chunk_ids:
-                    return 'modified'
+                    return ({"type": "modified"}, "modified")
                 chunk_ids1 = {c.id for c in item1.chunks}
                 chunk_ids2 = {c.id for c in item2.chunks}
                 added_ids = chunk_ids2 - chunk_ids1
                 removed_ids = chunk_ids1 - chunk_ids2
                 added = sum_chunk_size(item2, added_ids)
                 removed = sum_chunk_size(item1, removed_ids)
-                return '{:>9} {:>9}'.format(format_file_size(added, precision=1, sign=True),
-                                            format_file_size(-removed, precision=1, sign=True))
+                return ({"type": "modified", "added": added, "removed": removed},
+                        '{:>9} {:>9}'.format(format_file_size(added, precision=1, sign=True),
+                        format_file_size(-removed, precision=1, sign=True)))
 
         def compare_directory(item1, item2):
             if item2.get('deleted') and not item1.get('deleted'):
-                return 'removed directory'
+                return ({"type": 'removed directory'}, 'removed directory')
             elif item1.get('deleted') and not item2.get('deleted'):
-                return 'added directory'
+                return ({"type": 'added directory'}, 'added directory')
 
         def compare_owner(item1, item2):
             user1, group1 = get_owner(item1)
             user2, group2 = get_owner(item2)
             if user1 != user2 or group1 != group2:
-                return '[{}:{} -> {}:{}]'.format(user1, group1, user2, group2)
+                return ({"type": "owner", "old_user": user1, "old_group": group1, "new_user": user2, "new_group": group2},
+                        '[{}:{} -> {}:{}]'.format(user1, group1, user2, group2))
 
         def compare_mode(item1, item2):
             if item1.mode != item2.mode:
-                return '[{} -> {}]'.format(get_mode(item1), get_mode(item2))
+                mode1 = get_mode(item1)
+                mode2 = get_mode(item2)
+                return ({"type": "mode", "old_mode": mode1, "new_mode": mode2}, '[{} -> {}]'.format(mode1, mode2))
 
         def compare_items(output, path, item1, item2, hardlink_masters, deleted=False):
             """
@@ -1154,17 +1173,26 @@ class Archiver:
                 changes.append(compare_owner(item1, item2))
                 changes.append(compare_mode(item1, item2))
 
+            # changes is a list of paths, changesets:  [(path1, [{changeset1}, ..]), (path2, [{changeset1}, ..]), ..]
             changes = [x for x in changes if x]
             if changes:
-                output_line = (remove_surrogates(path), ' '.join(changes))
+                output_line = (remove_surrogates(path), changes)
 
+                # if sorting, save changes for later, otherwise go ahead and output the results as they are generated.
                 if args.sort:
                     output.append(output_line)
+                elif args.json_lines:
+                    print_json_output(output_line)
                 else:
-                    print_output(output_line)
+                    print_text_output(output_line)
 
-        def print_output(line):
-            print("{:<19} {}".format(line[1], line[0]))
+        def print_text_output(line):
+            path, diff = line
+            print("{:<19} {}".format(' '.join([txt for j, txt in diff]), path))
+
+        def print_json_output(line):
+            path, diff = line
+            print(json.dumps({"path": path, "changes": [j for j, txt in diff]}))
 
         def compare_archives(archive1, archive2, matcher):
             def hardlink_master_seen(item):
@@ -1230,6 +1258,10 @@ class Archiver:
                 assert hardlink_master_seen(item2)
                 compare_items(output, item1.path, item1, item2, hardlink_masters)
 
+            print_output = print_json_output if args.json_lines else print_text_output
+
+            # if we wanted sorted output (args.sort is true), then results are collected in 'output' and
+            # need to be sort them before printing. Otherwise results were already printed and 'output' is empty.
             for line in sorted(output):
                 print_output(line)
 
@@ -1708,12 +1740,6 @@ class Archiver:
     @with_repository(cache=True, exclusive=True, compatibility=(Manifest.Operation.CHECK,))
     def do_recreate(self, args, repository, manifest, key, cache):
         """Re-create archives"""
-        msg = ("recreate is an experimental feature.\n"
-               "Type 'YES' if you understand this and want to continue: ")
-        if not yes(msg, false_msg="Aborting.", truish=('YES',),
-                   env_var_override='BORG_RECREATE_I_KNOW_WHAT_I_AM_DOING'):
-            return EXIT_ERROR
-
         matcher = self.build_matcher(args.patterns, args.paths)
         self.output_list = args.output_list
         self.output_filter = args.output_filter
@@ -1791,21 +1817,24 @@ class Archiver:
         def repo_validate(section, name, value=None, check_value=True):
             if section not in ['repository', ]:
                 raise ValueError('Invalid section')
-            if name in ['segments_per_dir', 'max_segment_size', 'storage_quota', ]:
+            if name in ['segments_per_dir', ]:
                 if check_value:
                     try:
                         int(value)
                     except ValueError:
                         raise ValueError('Invalid value') from None
-                    if name == 'max_segment_size':
-                        if int(value) >= MAX_SEGMENT_SIZE_LIMIT:
-                            raise ValueError('Invalid value: max_segment_size >= %d' % MAX_SEGMENT_SIZE_LIMIT)
-            elif name in ['additional_free_space', ]:
+            elif name in ['max_segment_size', 'additional_free_space', 'storage_quota', ]:
                 if check_value:
                     try:
                         parse_file_size(value)
                     except ValueError:
                         raise ValueError('Invalid value') from None
+                    if name == 'storage_quota':
+                        if parse_file_size(value) < parse_file_size('10M'):
+                            raise ValueError('Invalid value: storage_quota < 10M')
+                    elif name == 'max_segment_size':
+                        if parse_file_size(value) >= MAX_SEGMENT_SIZE_LIMIT:
+                            raise ValueError('Invalid value: max_segment_size >= %d' % MAX_SEGMENT_SIZE_LIMIT)
             elif name in ['append_only', ]:
                 if check_value and value not in ['0', '1']:
                     raise ValueError('Invalid value')
@@ -2177,6 +2206,23 @@ class Archiver:
                     print("object %s not found [info from chunks cache]." % hex_id)
         return EXIT_SUCCESS
 
+    @with_repository(manifest=False, exclusive=True)
+    def do_debug_dump_hints(self, args, repository):
+        """dump repository hints"""
+        if not repository._active_txn:
+            repository.prepare_txn(repository.get_transaction_id())
+        try:
+            hints = dict(
+                segments=repository.segments,
+                compact=repository.compact,
+                storage_quota_use=repository.storage_quota_use,
+            )
+            with dash_open(args.path, 'w') as fd:
+                json.dump(hints, fd, indent=4)
+        finally:
+            repository.rollback()
+        return EXIT_SUCCESS
+
     def do_debug_convert_profile(self, args):
         """convert Borg profile to Python profile"""
         import marshal
@@ -2261,7 +2307,7 @@ class Archiver:
             This pattern style is (only) useful to match full paths.
             This is kind of a pseudo pattern as it can not have any variable or
             unspecified parts - the full path must be given.
-            `pf:root/file.ext` matches `root/file.txt` only.
+            `pf:root/file.ext` matches `root/file.ext` only.
 
             Implementation note: this is implemented via very time-efficient O(1)
             hashtable lookups (this means you can have huge amounts of such patterns
@@ -2320,8 +2366,10 @@ class Archiver:
             /home/*/junk
             *.tmp
             fm:aa:something/*
-            re:^/home/[^/]\\.tmp/
-            sh:/home/*/.thumbnails
+            re:^home/[^/]\\.tmp/
+            sh:home/*/.thumbnails
+             # Example with spaces, no need to escape as it is processed by borg
+            some file with spaces.txt
             EOF
             $ borg create --exclude-from exclude.txt backup /
 
@@ -2394,11 +2442,11 @@ class Archiver:
 
         {now}
             The current local date and time, by default in ISO-8601 format.
-            You can also supply your own `format string <https://docs.python.org/3.4/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {now:%Y-%m-%d_%H:%M:%S}
+            You can also supply your own `format string <https://docs.python.org/3.7/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {now:%Y-%m-%d_%H:%M:%S}
 
         {utcnow}
             The current UTC date and time, by default in ISO-8601 format.
-            You can also supply your own `format string <https://docs.python.org/3.4/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {utcnow:%Y-%m-%d_%H:%M:%S}
+            You can also supply your own `format string <https://docs.python.org/3.7/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {utcnow:%Y-%m-%d_%H:%M:%S}
 
         {user}
             The user name (or UID, if no name is available) of the user running borg.
@@ -2672,6 +2720,7 @@ class Archiver:
         # It will replace the entire :ref:`foo` verbatim.
         rst_plain_text_references = {
             'a_status_oddity': '"I am seeing ‘A’ (added) status for a unchanged file!?"',
+            'list_item_flags': '"Item flags"',
         }
 
         def process_epilog(epilog):
@@ -3046,6 +3095,9 @@ class Archiver:
         check_epilog = process_epilog("""
         The check command verifies the consistency of a repository and the corresponding archives.
 
+        check --repair is a potentially dangerous function and might lead to data loss
+        (for kinds of corruption it is not capable of dealing with). BE VERY CAREFUL!
+
         First, the underlying repository data files are checked:
 
         - For all segments, the segment magic header is checked.
@@ -3238,7 +3290,8 @@ class Archiver:
         directory.
 
         When giving '-' as path, borg will read data from standard input and create a
-        file 'stdin' in the created archive from that data.
+        file 'stdin' in the created archive from that data. See section *Reading from
+        stdin* below for details.
 
         The archive will consume almost no disk space for files or parts of files that
         have already been stored in other archives.
@@ -3280,6 +3333,7 @@ class Archiver:
           as it can not be set from userspace. But, a metadata-only change will already
           update the ctime, so there might be some unnecessary chunking/hashing even
           without content changes. Some filesystems do not support ctime (change time).
+          E.g. doing a chown or chmod to a file will change its ctime.
         - mtime usually works and only updates if file contents were changed. But mtime
           can be arbitrarily set from userspace, e.g. to set mtime back to the same value
           it had before a content change happened. This can be used maliciously as well as
@@ -3301,6 +3355,7 @@ class Archiver:
         exclusive because the data is not actually compressed and deduplicated during a dry run.
 
         See the output of the "borg help patterns" command for more help on exclude patterns.
+
         See the output of the "borg help placeholders" command for more help on placeholders.
 
         .. man NOTES
@@ -3318,6 +3373,20 @@ class Archiver:
         only include the objects specified by ``--exclude-if-present`` in your backup,
         and not include any other contents of the containing folder, this can be enabled
         through using the ``--keep-exclude-tags`` option.
+
+        The ``-x`` or ``--one-file-system`` option excludes directories, that are mountpoints (and everything in them).
+        It detects mountpoints by comparing the device number from the output of ``stat()`` of the directory and its
+        parent directory. Specifically, it excludes directories for which ``stat()`` reports a device number different
+        from the device number of their parent. Be aware that in Linux (and possibly elsewhere) there are directories
+        with device number different from their parent, which the kernel does not consider a mountpoint and also the
+        other way around. Examples are bind mounts (possibly same device number, but always a mountpoint) and ALL
+        subvolumes of a btrfs (different device number from parent but not necessarily a mountpoint). Therefore when
+        using ``--one-file-system``, one should make doubly sure that the backup works as intended especially when using
+        btrfs. This is even more important, if the btrfs layout was created by someone else, e.g. a distribution
+        installer.
+
+
+        .. _list_item_flags:
 
         Item flags
         ++++++++++
@@ -3357,6 +3426,25 @@ class Archiver:
         - '-' = dry run, item was *not* backed up
         - 'x' = excluded, item was *not* backed up
         - '?' = missing status code (if you see this, please file a bug report!)
+
+        Reading from stdin
+        ++++++++++++++++++
+
+        To read from stdin, specify ``-`` as path and pipe directly to borg::
+
+            backup-vm --id myvm --stdout | borg create REPO::ARCHIVE -
+
+        Note that piping to borg creates an archive even if the command piping
+        to borg exits with a failure. In this case, **one can end up with
+        truncated output being backed up**.
+
+        Reading from stdin yields just a stream of data without file metadata
+        associated with it, and the files cache is not needed at all. So it is
+        safe to disable it via ``--no-files-cache`` and speed up backup
+        creation a bit.
+
+        By default, the content read from stdin is stored in a file called 'stdin'.
+        Use ``--stdin-name`` to change the name.
         """)
 
         subparser = subparsers.add_parser('create', parents=[common_parser], add_help=False,
@@ -3366,10 +3454,11 @@ class Archiver:
                                           help='create backup')
         subparser.set_defaults(func=self.do_create)
 
-        dryrun_group = subparser.add_mutually_exclusive_group()
-        dryrun_group.add_argument('-n', '--dry-run', dest='dry_run', action='store_true',
+        # note: --dry-run and --stats are mutually exclusive, but we do not want to abort when
+        #  parsing, but rather proceed with the dry-run, but without stats (see run() method).
+        subparser.add_argument('-n', '--dry-run', dest='dry_run', action='store_true',
                                help='do not create a backup archive')
-        dryrun_group.add_argument('-s', '--stats', dest='stats', action='store_true',
+        subparser.add_argument('-s', '--stats', dest='stats', action='store_true',
                                help='print statistics for the created archive')
 
         subparser.add_argument('--list', dest='output_list', action='store_true',
@@ -3384,6 +3473,12 @@ class Archiver:
                                help='do not load/update the file metadata cache used to detect unchanged files')
         subparser.add_argument('--stdin-name', metavar='NAME', dest='stdin_name', default='stdin',
                                help='use NAME in archive for stdin data (default: "stdin")')
+        subparser.add_argument('--stdin-user', metavar='USER', dest='stdin_user', default=uid2user(0),
+                                help='set user USER in archive for stdin data (default: %(default)r)')
+        subparser.add_argument('--stdin-group', metavar='GROUP', dest='stdin_group', default=gid2group(0),
+                                help='set group GROUP in archive for stdin data (default: %(default)r)')
+        subparser.add_argument('--stdin-mode', metavar='M', dest='stdin_mode', type=lambda s: int(s, 8), default=STDIN_MODE_DEFAULT,
+                                help='set mode to M in archive for stdin data (default: %(default)04o)')
 
         exclude_group = define_exclusion_group(subparser, tag_files=True)
         exclude_group.add_argument('--exclude-nodump', dest='exclude_nodump', action='store_true',
@@ -3391,7 +3486,7 @@ class Archiver:
 
         fs_group = subparser.add_argument_group('Filesystem options')
         fs_group.add_argument('-x', '--one-file-system', dest='one_file_system', action='store_true',
-                              help='stay in the same file system and do not store mount points of other file systems')
+                              help='stay in the same file system and do not store mount points of other file systems.  This might behave different from your expectations, see the docs.')
         fs_group.add_argument('--numeric-owner', dest='numeric_owner', action='store_true',
                               help='only store numeric user and group identifiers')
         fs_group.add_argument('--noatime', dest='noatime', action='store_true',
@@ -3402,6 +3497,10 @@ class Archiver:
                               help='do not store birthtime (creation date) into archive')
         fs_group.add_argument('--nobsdflags', dest='nobsdflags', action='store_true',
                               help='do not read and store bsdflags (e.g. NODUMP, IMMUTABLE) into archive')
+        fs_group.add_argument('--noacls', dest='noacls', action='store_true',
+                              help='do not read and store ACLs into archive')
+        fs_group.add_argument('--noxattrs', dest='noxattrs', action='store_true',
+                              help='do not read and store xattrs into archive')
         fs_group.add_argument('--ignore-inode', dest='ignore_inode', action='store_true',
                               help='ignore inode data in the file metadata cache used to detect unchanged files.')
         fs_group.add_argument('--files-cache', metavar='MODE', dest='files_cache_mode',
@@ -3470,6 +3569,10 @@ class Archiver:
                                help='only obey numeric user and group identifiers')
         subparser.add_argument('--nobsdflags', dest='nobsdflags', action='store_true',
                                help='do not extract/set bsdflags (e.g. NODUMP, IMMUTABLE)')
+        subparser.add_argument('--noacls', dest='noacls', action='store_true',
+                               help='do not extract/set ACLs')
+        subparser.add_argument('--noxattrs', dest='noxattrs', action='store_true',
+                               help='do not extract/set xattrs')
         subparser.add_argument('--stdout', dest='stdout', action='store_true',
                                help='write all extracted data to stdout')
         subparser.add_argument('--sparse', dest='sparse', action='store_true',
@@ -3565,6 +3668,8 @@ class Archiver:
                                help='Override check of chunker parameters.')
         subparser.add_argument('--sort', dest='sort', action='store_true',
                                help='Sort the output lines by file path.')
+        subparser.add_argument('--json-lines', action='store_true',
+                               help='Format output as JSON Lines. ')
         subparser.add_argument('location', metavar='REPO::ARCHIVE1',
                                type=location_validator(archive=True),
                                help='repository location and ARCHIVE1 name')
@@ -3792,7 +3897,8 @@ class Archiver:
         subparser.add_argument('-n', '--dry-run', dest='dry_run', action='store_true',
                                help='do not change repository')
         subparser.add_argument('--force', dest='forced', action='store_true',
-                               help='force pruning of corrupted archives')
+                               help='force pruning of corrupted archives, '
+                                    'use ``--force --force`` in case ``--force`` does not work.')
         subparser.add_argument('-s', '--stats', dest='stats', action='store_true',
                                help='print statistics for the deleted archive')
         subparser.add_argument('--list', dest='output_list', action='store_true',
@@ -3926,11 +4032,13 @@ class Archiver:
         recreate_epilog = process_epilog("""
         Recreate the contents of existing archives.
 
-        This is an *experimental* feature. Do *not* use this on your only backup.
+        recreate is a potentially dangerous function and might lead to data loss
+        (if used wrongly). BE VERY CAREFUL!
 
-        ``--exclude``, ``--exclude-from``, ``--exclude-if-present``, ``--keep-exclude-tags``, and PATH
-        have the exact same semantics as in "borg create". If PATHs are specified the
-        resulting archive will only contain files from these PATHs.
+        ``--exclude``, ``--exclude-from``, ``--exclude-if-present``, ``--keep-exclude-tags``
+        and PATH have the exact same semantics as in "borg create", but they only check
+        for files in the archives and not in the local file system. If PATHs are specified,
+        the resulting archives will only contain files from these PATHs.
 
         Note that all paths in an archive are relative, therefore absolute patterns/paths
         will *not* match (``--exclude``, ``--exclude-from``, PATHs).
@@ -3948,7 +4056,7 @@ class Archiver:
         Depending on the PATHs and patterns given, recreate can be used to permanently
         delete files from archives.
         When in doubt, use ``--dry-run --verbose --list`` to see how patterns/PATHS are
-        interpreted.
+        interpreted. See :ref:`list_item_flags` in ``borg create`` for details.
 
         The archive being recreated is only removed after the operation completes. The
         archive that is built during the operation exists at the same time at
@@ -4269,6 +4377,21 @@ class Archiver:
         subparser.add_argument('ids', metavar='IDs', nargs='+', type=str,
                                help='hex object ID(s) to show refcounts for')
 
+        debug_dump_hints_epilog = process_epilog("""
+        This command dumps the repository hints data.
+        """)
+        subparser = debug_parsers.add_parser('dump-hints', parents=[common_parser], add_help=False,
+                                          description=self.do_debug_dump_hints.__doc__,
+                                          epilog=debug_dump_hints_epilog,
+                                          formatter_class=argparse.RawDescriptionHelpFormatter,
+                                          help='dump repo hints (debug)')
+        subparser.set_defaults(func=self.do_debug_dump_hints)
+        subparser.add_argument('location', metavar='REPOSITORY',
+                               type=location_validator(archive=False),
+                               help='repository to dump')
+        subparser.add_argument('path', metavar='PATH', type=str,
+                               help='file to dump data into')
+
         debug_convert_profile_epilog = process_epilog("""
         Convert a Borg profile to a Python cProfile compatible profile.
         """)
@@ -4365,27 +4488,27 @@ class Archiver:
                 # make sure we only process like normal if the client is executing
                 # the same command as specified in the forced command, otherwise
                 # just skip this block and return the forced command (== result).
-                # client is allowed to specify the whitelisted options,
+                # client is allowed to specify the allowlisted options,
                 # everything else comes from the forced "borg serve" command (or the defaults).
-                # stuff from blacklist must never be used from the client.
-                blacklist = {
+                # stuff from denylist must never be used from the client.
+                denylist = {
                     'restrict_to_paths',
                     'restrict_to_repositories',
                     'append_only',
                     'storage_quota',
                 }
-                whitelist = {
+                allowlist = {
                     'debug_topics',
                     'lock_wait',
                     'log_level',
                     'umask',
                 }
                 not_present = object()
-                for attr_name in whitelist:
-                    assert attr_name not in blacklist, 'whitelist has blacklisted attribute name %s' % attr_name
+                for attr_name in allowlist:
+                    assert attr_name not in denylist, 'allowlist has denylisted attribute name %s' % attr_name
                     value = getattr(client_result, attr_name, not_present)
                     if value is not not_present:
-                        # note: it is not possible to specify a whitelisted option via a forced command,
+                        # note: it is not possible to specify a allowlisted option via a forced command,
                         # it always gets overridden by the value specified (or defaulted to) by the client commmand.
                         setattr(result, attr_name, value)
 
@@ -4408,6 +4531,8 @@ class Archiver:
                               self.do_list, self.do_mount, self.do_umount}
             if func not in bypass_allowed:
                 raise Error('Not allowed to bypass locking mechanism for chosen command')
+        if getattr(args, 'timestamp', None):
+            args.location = args.location.with_timestamp(args.timestamp)
         return args
 
     def prerun_checks(self, logger, is_serve):
@@ -4590,17 +4715,17 @@ def main():  # pragma: no cover
             msg = 'Keyboard interrupt'
             tb_log_level = logging.DEBUG
             tb = '%s\n%s' % (traceback.format_exc(), sysinfo())
-            exit_code = EXIT_ERROR
+            exit_code = EXIT_SIGNAL_BASE + 2
         except SigTerm:
             msg = 'Received SIGTERM'
             msgid = 'Signal.SIGTERM'
             tb_log_level = logging.DEBUG
             tb = '%s\n%s' % (traceback.format_exc(), sysinfo())
-            exit_code = EXIT_ERROR
+            exit_code = EXIT_SIGNAL_BASE + 15
         except SigHup:
             msg = 'Received SIGHUP.'
             msgid = 'Signal.SIGHUP'
-            exit_code = EXIT_ERROR
+            exit_code = EXIT_SIGNAL_BASE + 1
         if msg:
             logger.error(msg, msgid=msgid)
         if tb:
@@ -4614,6 +4739,8 @@ def main():  # pragma: no cover
                 rc_logger.warning(exit_msg % ('warning', exit_code))
             elif exit_code == EXIT_ERROR:
                 rc_logger.error(exit_msg % ('error', exit_code))
+            elif exit_code >= EXIT_SIGNAL_BASE:
+                rc_logger.error(exit_msg % ('signal', exit_code))
             else:
                 rc_logger.error(exit_msg % ('abnormal', exit_code or 666))
         sys.exit(exit_code)

@@ -3,18 +3,15 @@ import os
 import io
 import re
 import sys
+import textwrap
 from collections import OrderedDict
 from datetime import datetime
 from glob import glob
 
-from distutils.command.build import build
-from distutils.core import Command
-
-import textwrap
-
 import setup_lz4
 import setup_zstd
 import setup_b2
+import setup_xxhash
 
 # True: use the shared liblz4 (>= 1.7.0 / r129) from the system, False: use the bundled lz4 code
 prefer_system_liblz4 = True
@@ -25,9 +22,12 @@ prefer_system_libzstd = True
 # True: use the shared libb2 from the system, False: use the bundled blake2 code
 prefer_system_libb2 = True
 
+# True: use the shared libxxhash (>= 0.6.5 [>= 0.7.2 on ARM]) from the system, False: use the bundled xxhash code
+prefer_system_libxxhash = True
+
 # prefer_system_msgpack is another option, but you need to set it in src/borg/helpers.py.
 
-min_python = (3, 4)
+min_python = (3, 5)
 my_python = sys.version_info
 
 if my_python < min_python:
@@ -44,28 +44,17 @@ install_requires = []
 # llfuse package. "borg mount" needs llfuse to work.
 # if you do not have llfuse, do not require it, most of borgbackup will work.
 extras_require = {
-    # llfuse 0.40 (tested, proven, ok), needs FUSE version >= 2.8.0
-    # llfuse 0.41 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 0.41.1 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 0.42 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 1.0 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 1.1.1 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 1.2 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 1.3 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 2.0 will break API
-    'fuse': ['llfuse<2.0', ],
+    'fuse': [
+        # 1.3.8 is the fixed version that works on py39 AND freebsd.
+        # if you cythonize yourself and make sure llfuse works for your
+        # OS and python version, you can use other versions than 1.3.8, too.
+        'llfuse >=1.3.4',  # should nowadays pull 1.3.8 or better
+    ],
 }
-
-if sys.platform.startswith('freebsd'):
-    # llfuse was frequently broken / did not build on freebsd
-    # llfuse 0.41.1, 1.1 are ok
-    extras_require['fuse'] = ['llfuse <2.0, !=0.42.*, !=0.43, !=1.0', ]
-
-if my_python >= (3, 7):
-    extras_require['fuse'][0] += ', >=1.3.4'
 
 from setuptools import setup, find_packages, Extension
 from setuptools.command.sdist import sdist
+from distutils.core import Command
 from distutils.command.clean import clean
 
 compress_source = 'src/borg/compress.pyx'
@@ -90,7 +79,6 @@ cython_c_sources = [
     hashindex_source,
     item_source,
     checksums_source,
-
     platform_posix_source,
     platform_linux_source,
     platform_syncfilerange_source,
@@ -180,7 +168,7 @@ library_dirs = []
 define_macros = []
 
 possible_openssl_prefixes = ['/usr', '/usr/local', '/usr/local/opt/openssl', '/usr/local/ssl', '/usr/local/openssl',
-                             '/usr/local/borg', '/opt/local', '/opt/pkg', ]
+                             '/usr/local/borg', '/opt/local', '/opt/pkg', '/opt/homebrew/opt/openssl@1.1', ]
 if os.environ.get('BORG_OPENSSL_PREFIX'):
     possible_openssl_prefixes.insert(0, os.environ.get('BORG_OPENSSL_PREFIX'))
 ssl_prefix = detect_openssl(possible_openssl_prefixes)
@@ -225,6 +213,18 @@ if prefer_system_libzstd and libzstd_prefix:
     libzstd_system = True
 else:
     libzstd_system = False
+
+possible_libxxhash_prefixes = ['/usr', '/usr/local', '/usr/local/opt/libxxhash', '/usr/local/libxxhash',
+                           '/usr/local/borg', '/opt/local', '/opt/pkg', ]
+if os.environ.get('BORG_LIBXXHASH_PREFIX'):
+    possible_libxxhash_prefixes.insert(0, os.environ.get('BORG_LIBXXHASH_PREFIX'))
+libxxhash_prefix = setup_xxhash.xxhash_system_prefix(possible_libxxhash_prefixes)
+if prefer_system_libxxhash and libxxhash_prefix:
+    print('Detected and preferring libxxhash over bundled XXHASH')
+    define_macros.append(('BORG_USE_LIBXXHASH', 'YES'))
+    libxxhash_system = True
+else:
+    libxxhash_system = False
 
 
 with open('README.rst', 'r') as fd:
@@ -805,6 +805,10 @@ if not on_rtd:
                                                system_prefix=libb2_prefix, system=libb2_system,
                                                **crypto_ext_kwargs)
 
+    crypto_ext_kwargs = setup_xxhash.xxhash_ext_kwargs(bundled_path='src/borg/algorithms/xxh64',
+                                               system_prefix=libxxhash_prefix, system=libxxhash_system,
+                                               **crypto_ext_kwargs)
+
     msgpack_endian = '__BIG_ENDIAN__' if (sys.byteorder == 'big') else '__LITTLE_ENDIAN__'
     msgpack_macros = [(msgpack_endian, '1')]
     msgpack_packer_ext_kwargs = dict(
@@ -866,10 +870,12 @@ setup(
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
         'Topic :: Security :: Cryptography',
         'Topic :: System :: Archiving :: Backup',
     ],

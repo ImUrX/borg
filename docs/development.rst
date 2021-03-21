@@ -131,13 +131,13 @@ you run the tests.
 Continuous Integration
 ----------------------
 
-All pull requests go through Travis-CI_, which runs the tests on Linux
+All pull requests go through `GitHub Actions`_, which runs the tests on Linux
 and Mac OS X as well as the flake8 style checker. Windows builds run on AppVeyor_,
 while additional Unix-like platforms are tested on Golem_.
 
 .. _AppVeyor: https://ci.appveyor.com/project/borgbackup/borg/
 .. _Golem: https://golem.enkore.de/view/Borg/
-.. _Travis-CI: https://travis-ci.org/borgbackup/borg
+.. _GitHub Actions: https://github.com/borgbackup/borg/actions
 
 Output and Logging
 ------------------
@@ -156,7 +156,7 @@ controlled by that flag.  See ``_setup_implied_logging()`` in
 Building a development environment
 ----------------------------------
 
-First, just install borg into a virtual env as described before.
+First, just install borg into a virtual env :ref:`as described before <git-installation>`.
 
 To install some additional packages needed for running the tests, activate your
 virtual env and run::
@@ -182,7 +182,7 @@ Some more advanced examples::
   # verify a changed tox.ini (run this after any change to tox.ini):
   fakeroot -u tox --recreate
 
-  fakeroot -u tox -e py34  # run all tests, but only on python 3.4
+  fakeroot -u tox -e py37  # run all tests, but only on python 3.7
 
   fakeroot -u tox borg.testsuite.locking  # only run 1 test module
 
@@ -213,6 +213,13 @@ from ``.coafile`` there:
 
 Some bears have additional requirements and they usually tell you about
 them in case they are missing.
+
+
+Adding a compression algorithm
+------------------------------
+
+If you want to add a new compression algorithm, please refer to :issue:`1633`
+and leave a post there in order to discuss about the proposal.
 
 Documentation
 -------------
@@ -315,13 +322,13 @@ Checklist:
   next milestone.
 - Check if there are any pending fixes for security issues.
 - Find and fix any low hanging fruit left on the issue tracker.
-- Check that Travis CI is happy.
+- Check that GitHub Actions CI is happy.
 - Update ``CHANGES.rst``, based on ``git log $PREVIOUS_RELEASE..``.
 - Check version number of upcoming release in ``CHANGES.rst``.
 - Render ``CHANGES.rst`` via ``make html`` and check for markup errors.
 - Verify that ``MANIFEST.in`` and ``setup.py`` are complete.
 - ``python setup.py build_usage ; python setup.py build_man`` and
-  commit (be sure to build with Python 3.4 or 3.5 as Python 3.6 added `more
+  commit (be sure to build with Python 3.5 as Python 3.6 added `more
   guaranteed hashing algorithms
   <https://github.com/borgbackup/borg/issues/2123>`_).
 - Tag the release::

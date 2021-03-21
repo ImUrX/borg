@@ -191,7 +191,6 @@ backed up and that the ``prune`` command is keeping and deleting the correct bac
         --compression lz4               \
         --exclude-caches                \
         --exclude '/home/*/.cache/*'    \
-        --exclude '/var/cache/*'        \
         --exclude '/var/tmp/*'          \
                                         \
         ::'{hostname}-{now}'            \
@@ -433,7 +432,7 @@ For restoring, you usually want to work **on the same machine as the same user**
 that was also used to create the backups of the wanted files. Doing it like
 that avoids quite some issues:
 
-- no confusion relating to pathes
+- no confusion relating to paths
 - same mapping of user/group names to user/group IDs
 - no permission issues
 - you likely already have a working borg setup there,

@@ -20,6 +20,10 @@ REQUIRED_ARCHIVE_KEYS = frozenset(['version', 'name', 'items', 'cmdline', 'time'
 # default umask, overridden by --umask, defaults to read/write only for owner
 UMASK_DEFAULT = 0o077
 
+# default file mode to store stdin data, defaults to read/write for owner and group
+# forcing to 0o100XXX later
+STDIN_MODE_DEFAULT = 0o660
+
 CACHE_TAG_NAME = 'CACHEDIR.TAG'
 CACHE_TAG_CONTENTS = b'Signature: 8a477f597d28d172789f06886806bc55'
 
@@ -76,6 +80,7 @@ DEFAULT_FILES_CACHE_MODE = 'cis'  # == CacheMode(DEFAULT_FILES_CACHE_MODE_UI)
 EXIT_SUCCESS = 0  # everything done, no problems
 EXIT_WARNING = 1  # reached normal end of operation, but there were issues
 EXIT_ERROR = 2  # terminated abruptly, did not reach end of operation
+EXIT_SIGNAL_BASE = 128  # terminated due to signal, rc = 128 + sig_no
 
 # never use datetime.isoformat(), it is evil. always use one of these:
 # datetime.strftime(ISO_FORMAT)  # output always includes .microseconds

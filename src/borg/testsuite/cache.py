@@ -208,7 +208,7 @@ class TestCacheSynchronizer:
 
 
 class TestAdHocCache:
-    @pytest.yield_fixture
+    @pytest.fixture
     def repository(self, tmpdir):
         self.repository_location = os.path.join(str(tmpdir), 'repository')
         with Repository(self.repository_location, exclusive=True, create=True) as repository:
@@ -257,7 +257,7 @@ class TestAdHocCache:
             repository.get(H(5))
 
     def test_files_cache(self, cache):
-        assert cache.file_known_and_unchanged(bytes(32), None) == (False, None)
+        assert cache.file_known_and_unchanged(b'foo', bytes(32), None) == (False, None)
         assert cache.cache_mode == 'd'
         assert cache.files is None
 

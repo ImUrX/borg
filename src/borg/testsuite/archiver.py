@@ -61,8 +61,6 @@ from .platform import fakeroot_detected
 from .upgrader import make_attic_repo
 from . import key
 
-# 3.4.3 == first version with argparse bugfix for nargs='*' and 0 arguments given
-argparse_nargs0_fixed = sys.version_info >= (3, 4, 3)
 
 src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -252,7 +250,6 @@ class ArchiverTestCaseBase(BaseTestCase):
     def setUp(self):
         os.environ['BORG_CHECK_I_KNOW_WHAT_I_AM_DOING'] = 'YES'
         os.environ['BORG_DELETE_I_KNOW_WHAT_I_AM_DOING'] = 'YES'
-        os.environ['BORG_RECREATE_I_KNOW_WHAT_I_AM_DOING'] = 'YES'
         os.environ['BORG_PASSPHRASE'] = 'waytooeasyonlyfortests'
         self.archiver = not self.FORK_DEFAULT and Archiver() or None
         self.tmpdir = tempfile.mkdtemp()
@@ -385,6 +382,8 @@ class ArchiverTestCaseBase(BaseTestCase):
 
 
 class ArchiverTestCase(ArchiverTestCaseBase):
+    requires_hardlinks = pytest.mark.skipif(not are_hardlinks_supported(), reason='hardlinks not supported')
+
     def test_basic_functionality(self):
         have_root = self.create_test_files()
         # fork required to test show-rc output
@@ -447,6 +446,25 @@ class ArchiverTestCase(ArchiverTestCaseBase):
 
         # the interesting parts of info_output2 and info_output should be same
         self.assert_equal(filter(info_output), filter(info_output2))
+
+    @requires_hardlinks
+    def test_create_duplicate_root(self):
+        # setup for #5603
+        path_a = os.path.join(self.input_path, 'a')
+        path_b = os.path.join(self.input_path, 'b')
+        os.mkdir(path_a)
+        os.mkdir(path_b)
+        hl_a = os.path.join(path_a, 'hardlink')
+        hl_b = os.path.join(path_b, 'hardlink')
+        self.create_regular_file(hl_a, contents=b'123456')
+        os.link(hl_a, hl_b)
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::test', 'input', 'input')  # give input twice!
+        # test if created archive has 'input' contents twice:
+        archive_list = self.cmd('list', '--json-lines', self.repository_location + '::test')
+        paths = [json.loads(line)['path'] for line in archive_list.split('\n') if line]
+        # we have all fs items exactly once!
+        assert paths == ['input', 'input/a', 'input/a/hardlink', 'input/b', 'input/b/hardlink']
 
     def test_init_parent_dirs(self):
         parent_path = os.path.join(self.tmpdir, 'parent1', 'parent2')
@@ -796,8 +814,6 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         self.cmd('init', '--encryption=repokey', self.repository_location)
         self.cmd('create', self.repository_location + '::test', 'input')
 
-    requires_hardlinks = pytest.mark.skipif(not are_hardlinks_supported(), reason='hardlinks not supported')
-
     @requires_hardlinks
     @unittest.skipUnless(has_llfuse, 'llfuse not installed')
     def test_fuse_mount_hardlinks(self):
@@ -860,6 +876,29 @@ class ArchiverTestCase(ArchiverTestCaseBase):
             assert open('input/dir1/subdir/hardlink', 'rb').read() == b'123456'
             assert os.stat('input/dir1/aaaa').st_nlink == 2
             assert os.stat('input/dir1/source2').st_nlink == 2
+
+    @requires_hardlinks
+    def test_extract_hardlinks_twice(self):
+        # setup for #5603
+        path_a = os.path.join(self.input_path, 'a')
+        path_b = os.path.join(self.input_path, 'b')
+        os.mkdir(path_a)
+        os.mkdir(path_b)
+        hl_a = os.path.join(path_a, 'hardlink')
+        hl_b = os.path.join(path_b, 'hardlink')
+        self.create_regular_file(hl_a, contents=b'123456')
+        os.link(hl_a, hl_b)
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.cmd('create', self.repository_location + '::test', 'input', 'input')  # give input twice!
+        # now test extraction
+        with changedir('output'):
+            self.cmd('extract', self.repository_location + '::test')
+            # if issue #5603 happens, extraction gives rc == 1 (triggering AssertionError) and warnings like:
+            # input/a/hardlink: link: [Errno 2] No such file or directory: 'input/a/hardlink' -> 'input/a/hardlink'
+            # input/b/hardlink: link: [Errno 2] No such file or directory: 'input/a/hardlink' -> 'input/b/hardlink'
+            # otherwise, when fixed, the hardlinks should be there and have a link count of 2
+            assert os.stat('input/a/hardlink').st_nlink == 2
+            assert os.stat('input/b/hardlink').st_nlink == 2
 
     def test_extract_include_exclude(self):
         self.cmd('init', '--encryption=repokey', self.repository_location)
@@ -1054,10 +1093,9 @@ class ArchiverTestCase(ArchiverTestCaseBase):
         self.cmd('init', '--encryption=repokey', self.repository_location)
         self.create_regular_file('file1', size=1024 * 80)
         self.create_regular_file('file2', size=1024 * 80)
-        if argparse_nargs0_fixed:
-            output = self.cmd('create', '-v', '--list', '--pattern=R input', self.repository_location + '::test')
-            self.assert_in("A input/file1", output)
-            self.assert_in("A input/file2", output)
+        output = self.cmd('create', '-v', '--list', '--pattern=R input', self.repository_location + '::test')
+        self.assert_in("A input/file1", output)
+        self.assert_in("A input/file2", output)
 
     def test_create_pattern(self):
         """test file patterns during create"""
@@ -1258,6 +1296,20 @@ class ArchiverTestCase(ArchiverTestCaseBase):
                  '--exclude-caches', '--keep-exclude-tags', self.repository_location + '::test')
         self._assert_test_keep_tagged()
 
+    @pytest.mark.skipif(not are_hardlinks_supported(), reason='hardlinks not supported')
+    def test_recreate_hardlinked_tags(self):  # test for issue #4911
+        self.cmd('init', '--encryption=none', self.repository_location)
+        self.create_regular_file('file1', contents=CACHE_TAG_CONTENTS)  # "wrong" filename, but correct tag contents
+        os.mkdir(os.path.join(self.input_path, 'subdir'))  # to make sure the tag is encountered *after* file1
+        os.link(os.path.join(self.input_path, 'file1'),
+                os.path.join(self.input_path, 'subdir', CACHE_TAG_NAME))  # correct tag name, hardlink to file1
+        self.cmd('create', self.repository_location + '::test', 'input')
+        # in the "test" archive, we now have, in this order:
+        # - a regular file item for "file1"
+        # - a hardlink item for "CACHEDIR.TAG" referring back to file1 for its contents
+        self.cmd('recreate', '--exclude-caches', '--keep-exclude-tags', self.repository_location + '::test')
+        # if issue #4911 is present, the recreate will crash with a KeyError for "input/file1"
+
     @pytest.mark.skipif(not xattr.XATTR_FAKEROOT, reason='Linux capabilities test, requires fakeroot >= 1.20.2')
     def test_extract_capabilities(self):
         fchown = os.fchown
@@ -1299,16 +1351,15 @@ class ArchiverTestCase(ArchiverTestCaseBase):
             input_abspath = os.path.abspath('input/file')
             with patch.object(xattr, 'setxattr', patched_setxattr_E2BIG):
                 out = self.cmd('extract', self.repository_location + '::test', exit_code=EXIT_WARNING)
-                assert out == (input_abspath + ': Value or key of extended attribute user.attribute is too big for this '
-                                               'filesystem\n')
+                assert out == (input_abspath + ': when setting extended attribute user.attribute: too big for this filesystem\n')
             os.remove(input_abspath)
             with patch.object(xattr, 'setxattr', patched_setxattr_ENOTSUP):
                 out = self.cmd('extract', self.repository_location + '::test', exit_code=EXIT_WARNING)
-                assert out == (input_abspath + ': Extended attributes are not supported on this filesystem\n')
+                assert out == (input_abspath + ': when setting extended attribute user.attribute: xattrs not supported on this filesystem\n')
             os.remove(input_abspath)
             with patch.object(xattr, 'setxattr', patched_setxattr_EACCES):
                 out = self.cmd('extract', self.repository_location + '::test', exit_code=EXIT_WARNING)
-                assert out == (input_abspath + ': Permission denied when setting extended attribute user.attribute\n')
+                assert out == (input_abspath + ': when setting extended attribute user.attribute: Permission denied\n')
             assert os.path.isfile(input_abspath)
 
     def test_path_normalization(self):
@@ -1496,11 +1547,12 @@ class ArchiverTestCase(ArchiverTestCaseBase):
             manifest, key = Manifest.load(repository, Manifest.NO_OPERATION_CHECK)
             archive = Archive(repository, key, manifest, 'test')
             for item in archive.iter_items():
-                if 'chunks' in item:
-                    first_chunk_id = item.chunks[0].id
-                    repository.delete(first_chunk_id)
-                    repository.commit()
+                if item.path.endswith('testsuite/archiver.py'):
+                    repository.delete(item.chunks[-1].id)
                     break
+            else:
+                assert False  # missed the file
+            repository.commit()
         output = self.cmd('delete', '--force', self.repository_location + '::test')
         self.assert_in('deleted archive was corrupted', output)
         self.cmd('check', '--repair', self.repository_location)
@@ -2779,7 +2831,7 @@ class ArchiverTestCase(ArchiverTestCaseBase):
 
         assert bin_to_hex(repo_id) in export_contents
         assert export_contents.startswith('<!doctype html>')
-        assert export_contents.endswith('</html>')
+        assert export_contents.endswith('</html>\n')
 
     def test_key_export_directory(self):
         export_directory = self.output_path + '/exported'
@@ -3484,10 +3536,12 @@ class ArchiverCorruptionTestCase(ArchiverTestCaseBase):
         self.cmd('init', '--encryption=repokey', self.repository_location)
         self.cache_path = json.loads(self.cmd('info', self.repository_location, '--json'))['cache']['path']
 
-    def corrupt(self, file):
+    def corrupt(self, file, amount=1):
         with open(file, 'r+b') as fd:
-            fd.seek(-1, io.SEEK_END)
-            fd.write(b'1')
+            fd.seek(-amount, io.SEEK_END)
+            corrupted = bytes(255-c for c in fd.read(amount))
+            fd.seek(-amount, io.SEEK_END)
+            fd.write(corrupted)
 
     def test_cache_chunks(self):
         self.corrupt(os.path.join(self.cache_path, 'chunks'))
@@ -3677,9 +3731,87 @@ class DiffArchiverTestCase(ArchiverTestCaseBase):
             if are_hardlinks_supported():
                 assert 'input/hardlink_target_replaced' not in output
 
+        def do_json_asserts(output, can_compare_ids):
+            def get_changes(filename, data):
+                chgsets = [j['changes'] for j in data if j['path'] == filename]
+                assert len(chgsets) < 2
+                # return a flattened list of changes for given filename
+                return [chg for chgset in chgsets for chg in chgset]
+
+            # convert output to list of dicts
+            joutput = [json.loads(line) for line in output.split('\n') if line]
+
+            # File contents changed (deleted and replaced with a new file)
+            expected = {'type': 'modified', 'added': 4096, 'removed': 1024} if can_compare_ids else {'type': 'modified'}
+            assert expected in get_changes('input/file_replaced', joutput)
+
+            # File unchanged
+            assert not any(get_changes('input/file_unchanged', joutput))
+
+            # Directory replaced with a regular file
+            if 'BORG_TESTS_IGNORE_MODES' not in os.environ:
+                assert {'type': 'mode', 'old_mode': 'drwxr-xr-x', 'new_mode': '-rwxr-xr-x'} in \
+                    get_changes('input/dir_replaced_with_file', joutput)
+
+            # Basic directory cases
+            assert {'type': 'added directory'} in get_changes('input/dir_added', joutput)
+            assert {'type': 'removed directory'} in get_changes('input/dir_removed', joutput)
+
+            if are_symlinks_supported():
+                # Basic symlink cases
+                assert {'type': 'changed link'} in get_changes('input/link_changed', joutput)
+                assert {'type': 'added link'} in get_changes('input/link_added', joutput)
+                assert {'type': 'removed link'} in get_changes('input/link_removed', joutput)
+
+                # Symlink replacing or being replaced
+                assert any(chg['type'] == 'mode' and chg['new_mode'].startswith('l') for chg in
+                    get_changes('input/dir_replaced_with_link', joutput))
+                assert any(chg['type'] == 'mode' and chg['old_mode'].startswith('l') for chg in
+                    get_changes('input/link_replaced_by_file', joutput))
+
+                # Symlink target removed. Should not affect the symlink at all.
+                assert not any(get_changes('input/link_target_removed', joutput))
+
+            # The inode has two links and the file contents changed. Borg
+            # should notice the changes in both links. However, the symlink
+            # pointing to the file is not changed.
+            expected = {'type': 'modified', 'added': 13, 'removed': 0} if can_compare_ids else {'type': 'modified'}
+            assert expected in get_changes('input/empty', joutput)
+            if are_hardlinks_supported():
+                assert expected in get_changes('input/hardlink_contents_changed', joutput)
+            if are_symlinks_supported():
+                assert not any(get_changes('input/link_target_contents_changed', joutput))
+
+            # Added a new file and a hard link to it. Both links to the same
+            # inode should appear as separate files.
+            assert {'type': 'added', 'size': 2048} in get_changes('input/file_added', joutput)
+            if are_hardlinks_supported():
+                assert {'type': 'added', 'size': 2048} in get_changes('input/hardlink_added', joutput)
+
+            # check if a diff between non-existent and empty new file is found
+            assert {'type': 'added', 'size': 0} in get_changes('input/file_empty_added', joutput)
+
+            # The inode has two links and both of them are deleted. They should
+            # appear as two deleted files.
+            assert {'type': 'removed', 'size': 256} in get_changes('input/file_removed', joutput)
+            if are_hardlinks_supported():
+                assert {'type': 'removed', 'size': 256} in get_changes('input/hardlink_removed', joutput)
+
+            # Another link (marked previously as the source in borg) to the
+            # same inode was removed. This should not change this link at all.
+            if are_hardlinks_supported():
+                assert not any(get_changes('input/hardlink_target_removed', joutput))
+
+            # Another link (marked previously as the source in borg) to the
+            # same inode was replaced with a new regular file. This should not
+            # change this link at all.
+            if are_hardlinks_supported():
+                assert not any(get_changes('input/hardlink_target_replaced', joutput))
+
         do_asserts(self.cmd('diff', self.repository_location + '::test0', 'test1a'), True)
         # We expect exit_code=1 due to the chunker params warning
         do_asserts(self.cmd('diff', self.repository_location + '::test0', 'test1b', exit_code=1), False)
+        do_json_asserts(self.cmd('diff', self.repository_location + '::test0', 'test1a', '--json-lines'), True)
 
     def test_sort_option(self):
         self.cmd('init', '--encryption=repokey', self.repository_location)
@@ -3836,13 +3968,7 @@ class TestCommonOptions:
 
     @pytest.fixture
     def subparsers(self, basic_parser):
-        if sys.version_info >= (3, 7):
-            # py37 pre-release defaults to unwanted required=True, in 3.7.0+ it was fixed to =False
-            return basic_parser.add_subparsers(title='required arguments', metavar='<command>', required=False)
-        else:
-            # py36 does not support required=... argument (but behaves like required=False).
-            # note: use below call for 3.6 and 3.7 when there are no alphas/betas/RCs of 3.7.0 around any more.
-            return basic_parser.add_subparsers(title='required arguments', metavar='<command>')
+        return basic_parser.add_subparsers(title='required arguments', metavar='<command>')
 
     @pytest.fixture
     def parser(self, basic_parser):

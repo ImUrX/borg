@@ -11,17 +11,26 @@ currently active recursion root. You usually give the recursion root(s)
 when invoking borg and these can be either relative or absolute paths.
 
 So, when you give `relative/` as root, the paths going into the matcher
-will look like `relative/.../file.ext`. When you give `/absolute/` as root,
-they will look like `/absolute/.../file.ext`. This is meant when we talk
-about "full path" below.
+will look like `relative/.../file.ext`. When you give `/absolute/` as
+root, they will look like `/absolute/.../file.ext`. This is meant when
+we talk about "full path" below.
+
+File paths in Borg archives are always stored normalized and relative.
+This means that e.g. ``borg create /path/to/repo ../some/path`` will
+store all files as `some/path/.../file.ext` and ``borg create
+/path/to/repo /home/user`` will store all files as
+`home/user/.../file.ext`. Therefore, always use relative paths in your
+patterns when matching archive content in commands like ``extract`` or
+``mount``. Starting with Borg 1.2 this behaviour will be changed to
+accept both absolute and relative paths.
 
 File patterns support these styles: fnmatch, shell, regular expressions,
 path prefixes and path full-matches. By default, fnmatch is used for
-``--exclude`` patterns and shell-style is used for the experimental ``--pattern``
-option.
+``--exclude`` patterns and shell-style is used for the experimental
+``--pattern`` option.
 
-If followed by a colon (':') the first two characters of a pattern are used as a
-style selector. Explicit style selection is necessary when a
+If followed by a colon (':') the first two characters of a pattern are
+used as a style selector. Explicit style selection is necessary when a
 non-default style is desired or when the desired pattern starts with
 two alphanumeric characters followed by a colon (i.e. `aa:something/*`).
 
@@ -65,7 +74,7 @@ Path full-match, selector `pf:`
     This pattern style is (only) useful to match full paths.
     This is kind of a pseudo pattern as it can not have any variable or
     unspecified parts - the full path must be given.
-    `pf:root/file.ext` matches `root/file.txt` only.
+    `pf:root/file.ext` matches `root/file.ext` only.
 
     Implementation note: this is implemented via very time-efficient O(1)
     hashtable lookups (this means you can have huge amounts of such patterns
@@ -124,8 +133,10 @@ Examples::
     /home/*/junk
     *.tmp
     fm:aa:something/*
-    re:^/home/[^/]\.tmp/
-    sh:/home/*/.thumbnails
+    re:^home/[^/]\.tmp/
+    sh:home/*/.thumbnails
+     # Example with spaces, no need to escape as it is processed by borg
+    some file with spaces.txt
     EOF
     $ borg create --exclude-from exclude.txt backup /
 
@@ -204,11 +215,11 @@ and ``--remote-path`` values support these placeholders:
 
 {now}
     The current local date and time, by default in ISO-8601 format.
-    You can also supply your own `format string <https://docs.python.org/3.4/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {now:%Y-%m-%d_%H:%M:%S}
+    You can also supply your own `format string <https://docs.python.org/3.7/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {now:%Y-%m-%d_%H:%M:%S}
 
 {utcnow}
     The current UTC date and time, by default in ISO-8601 format.
-    You can also supply your own `format string <https://docs.python.org/3.4/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {utcnow:%Y-%m-%d_%H:%M:%S}
+    You can also supply your own `format string <https://docs.python.org/3.7/library/datetime.html#strftime-and-strptime-behavior>`_, e.g. {utcnow:%Y-%m-%d_%H:%M:%S}
 
 {user}
     The user name (or UID, if no name is available) of the user running borg.
